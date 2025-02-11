@@ -3,19 +3,25 @@ import sys
 import uuid
 import asyncio
 
+COUNTER_SENT = 0
+COUNTER_RECEIVED = 0
 
 class EchoClientProtocol(asyncio.Protocol):
-    def __init__(self, destination_ip, destination_port, on_con_lost):
-        self.destination_ip = destination_ip
-        self.destination_port = destination_port
+    def __init__(self, on_con_lost):
+        self.destination_ip = None
+        self.destination_port = None
         self.on_con_lost = on_con_lost
         self.transport = None
 
     def connection_made(self, transport):
         self.transport = transport
+        self.destination_ip = self.transport.get_extra_info('peername')[0]
+        self.destination_port = self.transport.get_extra_info('peername')[1]
 
     def datagram_received(self, data, addr):
+        global COUNTER_RECEIVED
         print("Received:", data.decode())
+        COUNTER_RECEIVED += 1
 
     def error_received(self, exc):
         print('Error received:', exc)
@@ -25,6 +31,7 @@ class EchoClientProtocol(asyncio.Protocol):
         self.on_con_lost.set_result(True)
 
     async def send_loop(self):
+        global COUNTER_SENT
         while True:
             message = "\r\n".join([
                 f"OPTIONS sip:pinger@{self.destination_ip}:{self.destination_port} SIP/2.0",
@@ -40,6 +47,7 @@ class EchoClientProtocol(asyncio.Protocol):
                 "\r\n"  # for getting double \r\n at the end, as it need by RFC
             ])
             self.transport.sendto(message.encode())
+            COUNTER_SENT += 1
             await asyncio.sleep(0.5)
 
 
@@ -52,23 +60,25 @@ async def main():
 
 
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: EchoClientProtocol(
-            destination_ip=sys.argv[1],
-            destination_port=5060,
-            on_con_lost=on_con_lost),
-            remote_addr=(sys.argv[1], 5060)
+        lambda: EchoClientProtocol(on_con_lost=on_con_lost),
+        remote_addr=(sys.argv[1], 5060)
     )
 
     try:
         while True:
             await protocol.send_loop()
-    except KeyboardInterrupt:
-        print('Closing the socket')
+    except asyncio.CancelledError:
         transport.close()
     finally:
         transport.close()
 
-asyncio.run(main())
+
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    print('Closing the socket')
+    print(f"Sent: {COUNTER_SENT}")
+    print(f"Received: {COUNTER_RECEIVED}")
 
 
 
