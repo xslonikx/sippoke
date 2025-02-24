@@ -13,6 +13,7 @@ from logging import fatal
 from pprint import pprint
 from statistics import mean, stdev
 
+
 COUNTER_SENT = 0
 COUNTER_RECEIVED = 0
 
@@ -70,13 +71,18 @@ IP_PMTUDISC_PROBE = 3  # Ignore dst pmtu
 PAYLOAD_PATTERN = "the_quick_brown_fox_jumps_over_the_lazy_dog_" * 1489
 
 # messages templates for further formatting
-MSG_SENDING_REQS = "Sending {} SIP OPTIONS request{} (size {}) {}to {}:{} with timeout {:.03f}s..."
-MSG_RESP_FROM = "SEQ #{} ({} bytes sent) {}: Response from {} ({} bytes, {:.03f} sec RTT): {}"
 MSG_DF_BIT_NOT_SUPPORTED = "WARNING: ignoring dont_set_df_bit (-m) option that is not supported by this platform"
 MSG_UNABLE_TO_CONNECT = "FATAL: Unable to connect to {}:{}: {}"
 
-RESPONSE_MESSAGE_IPV4 = "Received {data_length} byte{suffix} from {host}:{port} :: {status_line} in {rtt:.3f}ms"
-RESPONSE_MESSAGE_IPV6 = "Received {data_length} byte{suffix} from [{host}]:{port} :: {status_line} in {rtt:.3f}ms"
+RESPONSE_MESSAGE_IPV4 = ("Received       :: {data_length:6} byte{suffix} response from {endpoint:27} :: {status_line}"
+                         " in {rtt:.3f}ms")
+RESPONSE_MESSAGE_IPV6 = ("Received       :: {data_length:6} byte{suffix} response from {endpoint:45} :: {status_line}"
+                         " in {rtt:.3f}ms")
+
+SEND_MESSAGE_IPV4 = ("Sent  #{current_req_count:<7} :: {msglen:6} byte{suffix} message  to   {endpoint:26}  ::"
+                     " {req_string}")
+SEND_MESSAGE_IPV6 = ("Sent  #{current_req_count} :: {msglen:6} byte{suffix} message  to   [{endpoint:42}] ::"
+                     " {req_string}")
 
 SPLIT_URI_REGEX = re.compile(
     "(?:(?P<user>[\w.]+):?(?P<password>[\w.]+)?@)?\[?(?P<host>(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|"
@@ -488,15 +494,21 @@ class SIPOptionsHandler(asyncio.Protocol):
         self.transport = None
         self.stats = Statistics()
         self._response_message = None
+        self._send_message = None
+        self.current_req_count = 0
+        self._address_family = None
 
     def connection_made(self, transport):
         self.transport = transport
         self.dst_addr, self.dst_port, *_ = self.transport.get_extra_info("peername")
         sock = self.transport.get_extra_info("socket")
-        if sock.family == socket.AF_INET:
+        self._address_family = sock.family
+        if self._address_family == socket.AF_INET:
             self._response_message = RESPONSE_MESSAGE_IPV4
-        elif sock.family == socket.AF_INET6:
+            self._send_message = SEND_MESSAGE_IPV4
+        elif self._address_family == socket.AF_INET6:
             self._response_message = RESPONSE_MESSAGE_IPV6
+            self._send_message = SEND_MESSAGE_IPV6
         else:
             logging.fatal("Address family {sock.family} is not supported}")
 
@@ -514,12 +526,12 @@ class SIPOptionsHandler(asyncio.Protocol):
         print(self._response_message.format(
             data_length=data_length,
             suffix=suffix,
-            host=host,
-            port=port,
+            endpoint=f"{host}:{port}" if self._address_family == socket.AF_INET else f"[{host}]:{port}",
             status_line=single_result.status_line,
             rtt=single_result.rtt)
         )
-        print(f"Raw response:", data.decode())
+        if self.c.verbose_mode:
+            print(f"Raw response:", data.decode())
 
     def parse_received_data(self, data):
         result = SingleResult()
@@ -559,8 +571,9 @@ class SIPOptionsHandler(asyncio.Protocol):
     async def send_loop(self):
         while True:
             cseq = self.stats.get_cseq()
+            req_string = f"OPTIONS sip:{self.c.to_uri} SIP/2.0"
             message = "\r\n".join([
-                f"OPTIONS sip:{self.c.to_uri} SIP/2.0",
+                req_string,
                 f"Via: SIP/2.0/{self.c.proto.upper()} {self.c.node_name};branch=z9hG4bK{uuid.uuid4()};rport",
                 f"Max-Forwards: 70",
                 f"To: <sip:{self.c.to_uri}>",
@@ -579,10 +592,22 @@ class SIPOptionsHandler(asyncio.Protocol):
             needed_payload_length = needed_payload_length if needed_payload_length > 0 else 0
             payload = PAYLOAD_PATTERN[:needed_payload_length]
             message = message.format(payload)
-
+            msglen = len(message)
             send_time = time.time()
+
             self.transport.sendto(message.encode())
+            snd_msg = self._send_message.format(
+                msglen=msglen,
+                suffix="s" if msglen > 1 else "",
+                endpoint=f"{self.c.dst_host}:{self.c.dst_port}",
+                current_req_count=self.current_req_count,
+                req_string=req_string
+            )
+            print(snd_msg)
+            if self.c.verbose_mode:
+                print("Raw request", message)
             self.stats.add_to_queue(cseq, send_time)
+            self.current_req_count += 1
             await asyncio.sleep(self.c.pause_between_transmits)
 
 
@@ -593,25 +618,25 @@ async def main():
     on_con_lost = loop.create_future()
     c = Config()
     print(f"Starting sippoke with packet len {c.payload_size}")
+    reuse_port = True if platform.system() in ["Linux", "Darwin"] else False
 
-    local_addr = (c.bind_addr, c.bind_port) if c.bind_addr else None
     transport, protocol = await loop.create_datagram_endpoint(
         lambda: SIPOptionsHandler(on_con_lost=on_con_lost),
         remote_addr=(c.dst_host, c.dst_port),
-        local_addr=local_addr,
+        local_addr=(c.bind_addr, c.bind_port) if c.bind_addr else None,
+        reuse_port=reuse_port,
     )
 
     try:
-        while True:
-            await protocol.send_loop()
+        await protocol.send_loop()
     except asyncio.CancelledError:
-        transport.close()
+        pass
     finally:
+        print("\n=========== FINISHED ===========")
         transport.close()
 
 def finish():
     stats = Statistics()
-    print("=========== FINISHED ===========")
     stats.finalize()
     stats.pretty_print()
 
