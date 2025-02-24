@@ -8,34 +8,30 @@ import argparse
 import time
 import platform
 import re
+from _socket import SOL_IP
+from abc import abstractmethod
 from logging import fatal
 
 from pprint import pprint
 from statistics import mean, stdev
-
-
-COUNTER_SENT = 0
-COUNTER_RECEIVED = 0
-
+from weakref import finalize
 
 VERSION = "0.0.1'"
 TOOL_DESCRIPTION = "sippoke is small tool that sends SIP OPTIONS requests to remote host and calculates latency."
 
 MAX_FORWARDS = 70  # times
 DFL_PING_TIMEOUT = 1.0  # seconds
-MAX_RECVBUF_SIZE = 1400  # bytes
 DFL_SIP_PORT = 5060
 DFL_REQS_COUNT = 0
 DFL_SIP_TRANSPORT = "udp"
-RTT_INFINITE = 99999999.0
 DFL_SEND_PAUSE = 0.5
 DFL_PAYLOAD_SIZE = 600  # bytes
 DFL_FROM_USER = "sippoke"
 DFL_TO_USER = "options"
 DFL_TLS_SEC_LEVEL = 3
 FAIL_EXIT_CODE = 1
-START_CSEQ = 1000   # to have constant-length CSeq field
-END_CSEQ = 2147483646
+START_CSEQ = 1
+END_CSEQ = 2147483646   # 2*31 - 1 as max possible cseq, as SIP 3261 tells
 CA_PATH_DARWIN = "/etc/ssl/cert.pem"
 CA_PATH_LINUX = "/etc/ssl/certs/ca-certificates.crt"   # Debian/Ubuntu path. Temporary path
 
@@ -59,14 +55,6 @@ DEFAULT_CIPHERS = (
 
 ALL_CIPHERS = "{}:{}".format(WEAK_CIPHERS, DEFAULT_CIPHERS)
 
-# Unfortunately, Python2.7 has no these definitions in socket module
-# Linux-specific definitions, taken from Linux in.h file
-IP_MTU_DISCOVER = 10
-IP_PMTUDISC_DONT = 0  # Never send DF frames
-IP_PMTUDISC_WANT = 1  # Use per route hints
-IP_PMTUDISC_DO = 2  # Always DF
-IP_PMTUDISC_PROBE = 3  # Ignore dst pmtu
-
 # length of this phrase * 1489 = totally 65536 bytes -- it's max theoretical size of UDP dgram
 PAYLOAD_PATTERN = "the_quick_brown_fox_jumps_over_the_lazy_dog_" * 1489
 
@@ -79,9 +67,9 @@ RESPONSE_MESSAGE_IPV4 = ("Received       :: {data_length:6} byte{suffix} respons
 RESPONSE_MESSAGE_IPV6 = ("Received       :: {data_length:6} byte{suffix} response from {endpoint:45} :: {status_line}"
                          " in {rtt:.3f}ms")
 
-SEND_MESSAGE_IPV4 = ("Sent  #{current_req_count:<7} :: {msglen:6} byte{suffix} message  to   {endpoint:26}  ::"
+SEND_MESSAGE_IPV4 = ("\nSent  #{current_req_count:<7} :: {msglen:6} byte{suffix} message  to   {endpoint:26}  ::"
                      " {req_string}")
-SEND_MESSAGE_IPV6 = ("Sent  #{current_req_count} :: {msglen:6} byte{suffix} message  to   [{endpoint:42}] ::"
+SEND_MESSAGE_IPV6 = ("\nSent  #{current_req_count} :: {msglen:6} byte{suffix} message  to   [{endpoint:42}] ::"
                      " {req_string}")
 
 SPLIT_URI_REGEX = re.compile(
@@ -91,6 +79,14 @@ SPLIT_URI_REGEX = re.compile(
 )
 
 CSEQ_REGEX = re.compile(r"CSeq: (\d+)", re.IGNORECASE | re.MULTILINE)
+
+# Unfortunately, Python2.7 has no these definitions in socket module
+# Linux-specific definitions, taken from Linux in.h file
+IP_MTU_DISCOVER = 10
+IP_PMTUDISC_DONT = 0  # Never send DF frames
+IP_PMTUDISC_WANT = 1  # Use per route hints
+IP_PMTUDISC_DO = 2  # Always DF
+IP_PMTUDISC_PROBE = 3  # Ignore dst pmtu
 
 
 def determine_ca_certs_path():
@@ -117,7 +113,7 @@ class Config(metaclass=Singleton):
     dst_port = DFL_SIP_PORT  # value may be redefined below
     bind_addr = ""
     bind_port = 0
-    count = 0
+    count = END_CSEQ
     timeout = DFL_PING_TIMEOUT
     proto = "udp"
     verbose_mode = False
@@ -166,7 +162,7 @@ class Config(metaclass=Singleton):
             dest="count",
             help="Number of requests, 0 for infinite ping (default)",
             type=int,
-            default=DFL_REQS_COUNT
+            default=END_CSEQ
         )
 
         ap.add_argument(
@@ -220,7 +216,7 @@ class Config(metaclass=Singleton):
         )
 
         ap.add_argument(
-            "-P",
+            "-p",
             dest="proto",
             help="Protocol (udp, tcp, tls)",
             type=str,
@@ -485,7 +481,7 @@ class Statistics(metaclass=Singleton):
         self._main_stats["std_deviation"] = stdev(self._received_queue) if len(self._received_queue) > 1 else 0.0
 
 
-class SIPOptionsHandler(asyncio.Protocol):
+class SIPOptionsBaseHandler(asyncio.Protocol):
     def __init__(self, on_con_lost):
         self.c = Config()
         self.dst_addr = None
@@ -512,11 +508,20 @@ class SIPOptionsHandler(asyncio.Protocol):
         else:
             logging.fatal("Address family {sock.family} is not supported}")
 
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-
+        if platform.system() == "Linux":
+            # small platform-specific notices
+            # df bit often set on linux systems because pmtu discovery often enabled by default
+            # but better not to rely on it and explicitly set and unset this
+            if self.c.dont_set_df_bit:
+                if self._address_family == socket.AF_INET:
+                    sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
+                else:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_DONTFRAG, 1)
 
     def datagram_received(self, data, addr):
+        """
+        for UDP handler
+        """
         data_length = len(data)
         suffix = "s" if len(data) > 1 else ""
 
@@ -564,41 +569,46 @@ class SIPOptionsHandler(asyncio.Protocol):
         print('Error received:', exc)
         stats = Statistics()
 
-
     def connection_lost(self, exc):
         self.on_con_lost.set_result(True)
 
+    def create_request(self):
+        cseq = self.stats.get_cseq()
+        req_string = f"OPTIONS sip:{self.c.to_uri} SIP/2.0"
+        message = "\r\n".join([
+            req_string,
+            f"Via: SIP/2.0/{self.c.proto.upper()} {self.c.node_name};branch=z9hG4bK{uuid.uuid4()};rport",
+            f"Max-Forwards: 70",
+            f"To: <sip:{self.c.to_uri}>",
+            f"From: <sip:{self.c.from_uri}>;tag={uuid.uuid4()}",
+            f"Call-ID: {uuid.uuid4()}",
+            f"CSeq: {cseq} OPTIONS",
+            f"Contact: <sip:{self.c.from_uri}>;transport={self.c.proto.lower()}",
+            "P-SipPoke-Payload: {}",
+            "Content-Length: 0",
+            "Accept: application/sdp",
+            "\r\n"  # for getting double \r\n at the end, as it need by RFC
+        ])
+
+        msglen_without_payload = len(message)
+        needed_payload_length = self.c.payload_size - msglen_without_payload + 2  # 2 bytes is placeholder {} itself
+        needed_payload_length = needed_payload_length if needed_payload_length > 0 else 0
+        payload = PAYLOAD_PATTERN[:needed_payload_length]
+        message = message.format(payload)
+        return req_string, cseq, message
+
+    @abstractmethod
+    def _send(self, message):
+        pass
+
     async def send_loop(self):
         while True:
-            cseq = self.stats.get_cseq()
-            req_string = f"OPTIONS sip:{self.c.to_uri} SIP/2.0"
-            message = "\r\n".join([
-                req_string,
-                f"Via: SIP/2.0/{self.c.proto.upper()} {self.c.node_name};branch=z9hG4bK{uuid.uuid4()};rport",
-                f"Max-Forwards: 70",
-                f"To: <sip:{self.c.to_uri}>",
-                f"From: <sip:{self.c.from_uri}>;tag={uuid.uuid4()}",
-                f"Call-ID: {uuid.uuid4()}",
-                f"CSeq: {cseq} OPTIONS",
-                f"Contact: <sip:{self.c.from_uri}>;transport={self.c.proto.lower()}",
-                "P-SipPoke-Payload: {}",
-                "Content-Length: 0",
-                "Accept: application/sdp",
-                "\r\n"  # for getting double \r\n at the end, as it need by RFC
-            ])
-
-            msglen_without_payload = len(message)
-            needed_payload_length = self.c.payload_size - msglen_without_payload + 2 # 2 bytes is placeholder {} itself
-            needed_payload_length = needed_payload_length if needed_payload_length > 0 else 0
-            payload = PAYLOAD_PATTERN[:needed_payload_length]
-            message = message.format(payload)
-            msglen = len(message)
             send_time = time.time()
-
-            self.transport.sendto(message.encode())
+            req_string, cseq, message = self.create_request()
+            self._send(message)
             snd_msg = self._send_message.format(
-                msglen=msglen,
-                suffix="s" if msglen > 1 else "",
+                msglen=len(message),
+                suffix="s" if len(message) > 1 else "",
                 endpoint=f"{self.c.dst_host}:{self.c.dst_port}",
                 current_req_count=self.current_req_count,
                 req_string=req_string
@@ -609,23 +619,75 @@ class SIPOptionsHandler(asyncio.Protocol):
             self.stats.add_to_queue(cseq, send_time)
             self.current_req_count += 1
             await asyncio.sleep(self.c.pause_between_transmits)
+            if self.current_req_count == self.c.count:
+                break
 
+
+class SIPOptionsUDPHandler(SIPOptionsBaseHandler):
+    def _send(self, message):
+        self.transport.sendto(message.encode())
+
+
+class SIPOptionsTCPHandler(SIPOptionsBaseHandler):
+    def _send(self, message):
+        self.transport.write(message.encode())
+
+    def data_received(self, data):
+        """
+        for TCP handler
+        """
+        data_length = len(data)
+        suffix = "s" if len(data) > 1 else ""
+
+        single_result = self.parse_received_data(data)
+        self.stats.mark_received(single_result)
+        print(self._response_message.format(
+            data_length=data_length,
+            suffix=suffix,
+            endpoint=f"{self.c.dst_host}:{self.c.dst_port}" if self._address_family == socket.AF_INET \
+                     else f"[{self.c.dst_host}]:{self.c.dst_port}",
+            status_line=single_result.status_line,
+            rtt=single_result.rtt)
+        )
+        if self.c.verbose_mode:
+            print(f"Raw response:", data.decode())
 
 async def main():
     # Get a reference to the event loop as we plan to use
     # low-level APIs.
     loop = asyncio.get_running_loop()
     on_con_lost = loop.create_future()
+    transport = None
+    protocol = None
     c = Config()
-    print(f"Starting sippoke with packet len {c.payload_size}")
+
+    # primitive check for ipv6 address format
+    dst_repr = f"{c.dst_host}:{c.dst_port}" if ":" not in c.dst_host else f"[{c.dst_host}]:{c.dst_port}"
+
+    if c.bind_addr:
+        src_repr = c.bind_addr if ":" not in c.bind_addr else f"[{c.bind_addr}]"
+        src_repr = src_repr if not c.bind_port else f"{src_repr}:{c.bind_port}"
+        print(f"Starting sippoke from {src_repr} to {dst_repr} with size {c.payload_size}\n")
+    else:
+        print(f"Starting sippoke to {dst_repr} with size {c.payload_size}\n")
+
     reuse_port = True if platform.system() in ["Linux", "Darwin"] else False
 
-    transport, protocol = await loop.create_datagram_endpoint(
-        lambda: SIPOptionsHandler(on_con_lost=on_con_lost),
-        remote_addr=(c.dst_host, c.dst_port),
-        local_addr=(c.bind_addr, c.bind_port) if c.bind_addr else None,
-        reuse_port=reuse_port,
-    )
+    if c.proto == "udp":
+        transport, protocol = await loop.create_datagram_endpoint(
+            lambda: SIPOptionsUDPHandler(on_con_lost=on_con_lost),
+            remote_addr=(c.dst_host, c.dst_port),
+            local_addr=(c.bind_addr, c.bind_port) if c.bind_addr else None,
+            reuse_port=reuse_port,
+        )
+
+    elif c.proto == "tcp":
+        transport, protocol = await loop.create_connection(
+            lambda: SIPOptionsTCPHandler(on_con_lost=on_con_lost),
+            host=c.dst_host,
+            port=c.dst_port,
+            local_addr=(c.bind_addr, c.bind_port) if c.bind_addr else None,
+        )
 
     try:
         await protocol.send_loop()
@@ -634,6 +696,7 @@ async def main():
     finally:
         print("\n=========== FINISHED ===========")
         transport.close()
+        finish()
 
 def finish():
     stats = Statistics()
@@ -643,7 +706,7 @@ def finish():
 try:
     asyncio.run(main())
 except KeyboardInterrupt:
-    finish()
+    exit()
 
 
 
