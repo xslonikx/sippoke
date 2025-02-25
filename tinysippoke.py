@@ -632,6 +632,7 @@ class SIPOptionsTCPHandler(SIPOptionsBaseHandler):
     def _send(self, message):
         self.transport.write(message.encode())
 
+
     def data_received(self, data):
         """
         for TCP handler
@@ -688,6 +689,18 @@ async def main():
             port=c.dst_port,
             local_addr=(c.bind_addr, c.bind_port) if c.bind_addr else None,
         )
+
+    elif c.proto == "tls":
+        ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ssl_context.load_verify_locations(c.ca_certs_path)
+        transport, protocol = await loop.create_connection(
+            lambda: SIPOptionsTCPHandler(on_con_lost=on_con_lost),
+            host=c.dst_host,
+            port=c.dst_port,
+            local_addr=(c.bind_addr, c.bind_port) if c.bind_addr else None,
+            ssl=ssl_context,
+        )
+
 
     try:
         await protocol.send_loop()
