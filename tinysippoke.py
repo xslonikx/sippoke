@@ -8,15 +8,11 @@ import argparse
 import time
 import platform
 import re
-from _socket import SOL_IP
+
 from abc import abstractmethod
-from logging import fatal
-
-from pprint import pprint
 from statistics import mean, stdev
-from weakref import finalize
 
-VERSION = "0.0.1'"
+VERSION = "0.0.1"
 TOOL_DESCRIPTION = "sippoke is small tool that sends SIP OPTIONS requests to remote host and calculates latency."
 
 MAX_FORWARDS = 70  # times
@@ -117,13 +113,14 @@ class Config(metaclass=Singleton):
     timeout = DFL_PING_TIMEOUT
     proto = "udp"
     verbose_mode = False
-    bad_resp_is_fail = False
+    neg_resp_is_fail = False
     pause_between_transmits = DFL_SEND_PAUSE
     payload_size = DFL_PAYLOAD_SIZE
     dont_set_df_bit = False
     from_user = DFL_FROM_USER
     to_user = DFL_TO_USER
     tls_sec_level = DFL_TLS_SEC_LEVEL
+    tls_no_verify_cert=False
     from_uri = None    # will be set later
     to_uri = None   # will be set later
     ca_certs_path = ssl.get_default_verify_paths().cafile
@@ -167,7 +164,7 @@ class Config(metaclass=Singleton):
 
         ap.add_argument(
             "-f",
-            dest="bad_resp_is_fail",
+            dest="neg_resp_is_fail",
             help="Treat 4xx, 5xx, 6xx responses as failure (default no)",
             action="store_true"
         )
@@ -279,6 +276,13 @@ class Config(metaclass=Singleton):
         )
 
         tls_opts.add_argument(
+            "-Ti",
+            dest="tls_no_verify_cert",
+            help="Do not verify Server TLS certificate",
+            action="store_true",
+        )
+
+        tls_opts.add_argument(
             "-tU",
             dest="to_uri",
             help="Custom URI for Sip To: header (they may differ with actual destination)",
@@ -303,7 +307,9 @@ class Config(metaclass=Singleton):
             action="store_true"
         )
 
-        ap.add_argument("-V", action="version", version=VERSION)
+        ap.add_argument("-V",
+            action="version",
+            version=f"sippoke v.{VERSION} on {platform.platform()}/python{platform.python_version()}")
         return ap
 
     @staticmethod
@@ -330,7 +336,7 @@ class Config(metaclass=Singleton):
             "timeout": (float) Socket timeout
             "proto": Protocol (tcp or udp). Assertion for proto in (tcp, udp)
             "verbose_mode": (bool) Verbose mode
-            "bad_resp_is_fail": (bool) Treat 4xx, 5xx, 6xx responses as fail
+            "neg_resp_is_fail": (bool) Treat 4xx, 5xx, 6xx responses as fail
         }
         :param args: (argparse.Namespace) argparse CLI arguments
         :return: (dict) dictionary with params
@@ -339,7 +345,7 @@ class Config(metaclass=Singleton):
         self.timeout = args.sock_timeout
         self.proto = args.proto
         self.verbose_mode = args.verbose_mode
-        self.bad_resp_is_fail = args.bad_resp_is_fail
+        self.neg_resp_is_fail = args.neg_resp_is_fail
         self.pause_between_transmits = args.pause_between_transmits
         self.payload_size = args.payload_size
         self.dont_set_df_bit = args.dont_set_df_bit
@@ -398,16 +404,16 @@ class SingleResult:
         self.error_string = None
         self.receive_status = ""
 
-
 class Statistics(metaclass=Singleton):
     def __init__(self):
         self._pending_queue = {}
         self._received_queue = []
-
+        self.c = Config()
         self._main_stats = {
             "sent": 0,
             "received": 0,
             "lost": 0,
+            "failed": 0,
             "malformed": 0,
             "reordered": 0,
             "loss_percent": 100.0,
@@ -418,8 +424,10 @@ class Statistics(metaclass=Singleton):
             "std_deviation": float("inf"),
         }
 
-        self._response_codes_stats = {}
-        self._socket_errors_stats = {}
+        self._resp_codes = {}
+        self._resp_codes_percs = {}
+        self._socket_errors = {}
+        self._socket_errors_percs = {}
 
         self._current_cseq = START_CSEQ
         self._last_sent_cseq = START_CSEQ
@@ -444,9 +452,9 @@ class Statistics(metaclass=Singleton):
 
         if single_result.response_code:
             try:
-                self._response_codes_stats[single_result.response_code] += 1
+                self._resp_codes[single_result.response_code] += 1
             except KeyError:
-                self._response_codes_stats[single_result.response_code] = 1
+                self._resp_codes[single_result.response_code] = 1
 
     def get_send_time_for_cseq(self, cseq: int) -> float:
         cseq_time = self._pending_queue.pop(cseq)
@@ -455,22 +463,79 @@ class Statistics(metaclass=Singleton):
     def append_error_reason(self, error_reason: str):
         if error_reason:
             try:
-                self._socket_errors_stats[error_reason] += 1
+                self._socket_errors[error_reason] += 1
             except KeyError:
-                self._socket_errors_stats[error_reason] = 1
+                self._socket_errors[error_reason] = 1
 
-    def increment_unknown(self):
+    def increment_malformed(self):
         self._main_stats["malformed"] += 1
 
     def pretty_print(self):
-        pprint(self._main_stats)
+        perc_fmt = "{header:26s} {absolute:12d} / {percentage:0.3f}%"
+        float_value_str = "{:22s} {:9.3f}"
+        overall_result_message = "PASSED" if self._main_stats["overall_result"] else "FAILED"
+        print(f"Overall status: {overall_result_message}")
+        print(f"Total requests sent: {self._main_stats['sent']:18}")
 
+        print(perc_fmt.format(
+            header="Requests received:",
+            absolute=self._main_stats["received"],
+            percentage=100.0 - self._main_stats["loss_perc"],
+        ))
+        print("\nStatistics:")
+        print(perc_fmt.format(
+            header="Requests passed:",
+            absolute=self._main_stats["passed"],
+            percentage=self._main_stats["passed_perc"],
+        ))
+        print(perc_fmt.format(
+            header="Requests failed:",
+            absolute=self._main_stats["failed"],
+            percentage=self._main_stats["failed_perc"],
+        ))
+        print(perc_fmt.format(
+            header="Lost:",
+            absolute=self._main_stats["lost"],
+            percentage=self._main_stats["loss_perc"],
+        ))
+        print(perc_fmt.format(
+            header="Reordered:",
+            absolute=self._main_stats["reordered"],
+            percentage=self._main_stats["reordered_perc"],
+        ))
+        print(perc_fmt.format(
+            header="Malformed:",
+            absolute=self._main_stats["malformed"],
+            percentage=self._main_stats["malformed_perc"],
+        ))
+
+        if self._resp_codes:
+            print("\nResponse codes statistics:")
+            for code in self._resp_codes:
+                print(perc_fmt.format(
+                    header=str(code),
+                    absolute=self._resp_codes[code],
+                    percentage=self._resp_codes_percs[code],
+                ))
+
+        if self._socket_errors:
+            print("\nNetwork errors statistics:")
+            for e in self._socket_errors:
+                print(perc_fmt.format(
+                    header=str(e),
+                    absolute=self._socket_errors[e],
+                    percentage=self._socket_errors_percs[e],
+                ))
     def finalize(self):
         self._main_stats["lost"] += len(self._pending_queue)
+
+        # we treat lost as failed, but not all failed are lost
+        self._main_stats["failed"] += len(self._pending_queue)
+
         if self._main_stats["sent"] > 0:
-            self._main_stats["loss_percent"] = float(self._main_stats["lost"]) / float(self._main_stats["sent"]) * 100.0
+            self._main_stats["loss_perc"] = float(self._main_stats["lost"]) / float(self._main_stats["sent"]) * 100.0
         else:
-            self._main_stats["loss_percent"] = 100.0
+            self._main_stats["loss_perc"] = 100.0
 
         self._main_stats["min_latency"] = min(self._received_queue) if self._received_queue else float("inf")
         self._main_stats["max_latency"] = max(self._received_queue) if self._received_queue else float("-inf")
@@ -479,6 +544,28 @@ class Statistics(metaclass=Singleton):
             if self._received_queue else float("inf")
         self._main_stats["avg_latency"] = mean(self._received_queue) if self._received_queue else float("inf")
         self._main_stats["std_deviation"] = stdev(self._received_queue) if len(self._received_queue) > 1 else 0.0
+
+        for code in self._resp_codes:
+            self._resp_codes_percs[code] = self._resp_codes[code] / float(self._main_stats["sent"]) * 100.0
+            if  self.c.neg_resp_is_fail and code >= 400:
+                self._main_stats["failed"] += self._resp_codes[code]
+
+        for code in self._socket_errors:
+            self._socket_errors_percs[code] = self._resp_codes[code] / float(self._main_stats["sent"]) * 100.0
+
+        self._main_stats["passed"] = self._main_stats["sent"] - self._main_stats["failed"]
+        self._main_stats["failed_perc"] = self._main_stats["failed"] / float(self._main_stats["sent"]) * 100.0
+        self._main_stats["passed_perc"] = self._main_stats["passed"] / float(self._main_stats["sent"]) * 100.0
+        self._main_stats["malformed_perc"] = self._main_stats["malformed"] / float(self._main_stats["sent"]) * 100.0
+        self._main_stats["reordered_perc"] = self._main_stats["reordered"] / float(self._main_stats["sent"]) * 100.0
+
+        if self.c.fail_perc:
+            self._main_stats["overall_result"] = True if self._main_stats["failed_perc"] < self.c.fail_perc else False
+        elif self.c.fail_count:
+            self._main_stats["overall_result"] = True if self._main_stats["failed"] < self.c.fail_count else False
+        else:
+            self._main_stats["overall_result"] = True if self._main_stats["failed"] < self._main_stats["passed"] \
+                                                 else False
 
 
 class SIPOptionsBaseHandler(asyncio.Protocol):
@@ -547,7 +634,7 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
 
         try:
             _, resp_code, resp_text = raw_status_line.split(" ", maxsplit=2)
-            result.resp_code = int(resp_code)
+            result.response_code = int(resp_code)
             result.status_line = raw_status_line
         except (IndexError, ValueError):
             result.receive_status = "malformed"
@@ -668,9 +755,9 @@ async def main():
     if c.bind_addr:
         src_repr = c.bind_addr if ":" not in c.bind_addr else f"[{c.bind_addr}]"
         src_repr = src_repr if not c.bind_port else f"{src_repr}:{c.bind_port}"
-        print(f"Starting sippoke from {src_repr} to {dst_repr} with size {c.payload_size}\n")
+        print(f"Starting to send SIP OPTIONS from {src_repr} to {dst_repr} with size {c.payload_size}\n")
     else:
-        print(f"Starting sippoke to {dst_repr} with size {c.payload_size}\n")
+        print(f"Starting to send SIP OPTIONS to {dst_repr} with size {c.payload_size}\n")
 
     reuse_port = True if platform.system() in ["Linux", "Darwin"] else False
 
@@ -693,13 +780,19 @@ async def main():
     elif c.proto == "tls":
         ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ssl_context.load_verify_locations(c.ca_certs_path)
-        transport, protocol = await loop.create_connection(
-            lambda: SIPOptionsTCPHandler(on_con_lost=on_con_lost),
-            host=c.dst_host,
-            port=c.dst_port,
-            local_addr=(c.bind_addr, c.bind_port) if c.bind_addr else None,
-            ssl=ssl_context,
-        )
+        if c.tls_no_verify_cert:
+            ssl_context.verify_mode = ssl.CERT_NONE
+            ssl_context.check_hostname = False
+        try:
+            transport, protocol = await loop.create_connection(
+                lambda: SIPOptionsTCPHandler(on_con_lost=on_con_lost),
+                host=c.dst_host,
+                port=c.dst_port,
+                local_addr=(c.bind_addr, c.bind_port) if c.bind_addr else None,
+                ssl=ssl_context,
+            )
+        except ssl.SSLError as e:
+            print
 
 
     try:
@@ -707,19 +800,25 @@ async def main():
     except asyncio.CancelledError:
         pass
     finally:
-        print("\n=========== FINISHED ===========")
         transport.close()
-        finish()
 
 def finish():
+    print("\n=========== FINISHED ===========")
     stats = Statistics()
     stats.finalize()
     stats.pretty_print()
 
-try:
-    asyncio.run(main())
-except KeyboardInterrupt:
-    exit()
+    if stats._main_stats["overall_result"]:
+       exit(0)
+    else:
+       exit(1)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        finish()
+
 
 
 
