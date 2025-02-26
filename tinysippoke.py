@@ -409,7 +409,7 @@ class Statistics(metaclass=Singleton):
         self._pending_queue = {}
         self._received_queue = []
         self.c = Config()
-        self._main_stats = {
+        self.main_stats = {
             "sent": 0,
             "received": 0,
             "lost": 0,
@@ -424,17 +424,17 @@ class Statistics(metaclass=Singleton):
             "std_deviation": float("inf"),
         }
 
-        self._resp_codes = {}
-        self._resp_codes_percs = {}
-        self._socket_errors = {}
-        self._socket_errors_percs = {}
+        self.resp_codes = {}
+        self.resp_codes_percs = {}
+        self.socket_errors = {}
+        self.socket_errors_percs = {}
 
         self._current_cseq = START_CSEQ
         self._last_sent_cseq = START_CSEQ
 
     def add_to_queue(self, cseq: int, start_time: float):
         self._pending_queue[cseq] = start_time
-        self._main_stats["sent"] += 1
+        self.main_stats["sent"] += 1
 
     def get_cseq(self) -> int:
         self._last_sent_cseq = self._current_cseq
@@ -444,17 +444,17 @@ class Statistics(metaclass=Singleton):
     def mark_received(self, single_result: SingleResult):
         try:
             self._received_queue.append(single_result.rtt)
-            self._main_stats["received"] += 1
+            self.main_stats["received"] += 1
             if single_result.cseq < self._last_sent_cseq:
-                self._main_stats["reordered"] += 1
+                self.main_stats["reordered"] += 1
         except KeyError:
-            self._main_stats["malformed"] += 1
+            self.main_stats["malformed"] += 1
 
         if single_result.response_code:
             try:
-                self._resp_codes[single_result.response_code] += 1
+                self.resp_codes[single_result.response_code] += 1
             except KeyError:
-                self._resp_codes[single_result.response_code] = 1
+                self.resp_codes[single_result.response_code] = 1
 
     def get_send_time_for_cseq(self, cseq: int) -> float:
         cseq_time = self._pending_queue.pop(cseq)
@@ -463,108 +463,109 @@ class Statistics(metaclass=Singleton):
     def append_error_reason(self, error_reason: str):
         if error_reason:
             try:
-                self._socket_errors[error_reason] += 1
+                self.socket_errors[error_reason] += 1
             except KeyError:
-                self._socket_errors[error_reason] = 1
+                self.socket_errors[error_reason] = 1
 
     def increment_malformed(self):
-        self._main_stats["malformed"] += 1
+        self.main_stats["malformed"] += 1
 
     def pretty_print(self):
         perc_fmt = "{header:26s} {absolute:12d} / {percentage:0.3f}%"
         float_value_str = "{:22s} {:9.3f}"
-        overall_result_message = "PASSED" if self._main_stats["overall_result"] else "FAILED"
+        overall_result_message = "PASSED" if self.main_stats["overall_result"] else "FAILED"
         print(f"Overall status: {overall_result_message}")
-        print(f"Total requests sent: {self._main_stats['sent']:18}")
+        print(f"Total requests sent: {self.main_stats['sent']:18}")
 
         print(perc_fmt.format(
             header="Requests received:",
-            absolute=self._main_stats["received"],
-            percentage=100.0 - self._main_stats["loss_perc"],
+            absolute=self.main_stats["received"],
+            percentage=100.0 - self.main_stats["loss_perc"],
         ))
         print("\nStatistics:")
         print(perc_fmt.format(
             header="Requests passed:",
-            absolute=self._main_stats["passed"],
-            percentage=self._main_stats["passed_perc"],
+            absolute=self.main_stats["passed"],
+            percentage=self.main_stats["passed_perc"],
         ))
         print(perc_fmt.format(
             header="Requests failed:",
-            absolute=self._main_stats["failed"],
-            percentage=self._main_stats["failed_perc"],
+            absolute=self.main_stats["failed"],
+            percentage=self.main_stats["failed_perc"],
         ))
         print(perc_fmt.format(
             header="Lost:",
-            absolute=self._main_stats["lost"],
-            percentage=self._main_stats["loss_perc"],
+            absolute=self.main_stats["lost"],
+            percentage=self.main_stats["loss_perc"],
         ))
         print(perc_fmt.format(
             header="Reordered:",
-            absolute=self._main_stats["reordered"],
-            percentage=self._main_stats["reordered_perc"],
+            absolute=self.main_stats["reordered"],
+            percentage=self.main_stats["reordered_perc"],
         ))
         print(perc_fmt.format(
             header="Malformed:",
-            absolute=self._main_stats["malformed"],
-            percentage=self._main_stats["malformed_perc"],
+            absolute=self.main_stats["malformed"],
+            percentage=self.main_stats["malformed_perc"],
         ))
 
-        if self._resp_codes:
+        if self.resp_codes:
             print("\nResponse codes statistics:")
-            for code in self._resp_codes:
+            for code in self.resp_codes:
                 print(perc_fmt.format(
                     header=str(code),
-                    absolute=self._resp_codes[code],
-                    percentage=self._resp_codes_percs[code],
+                    absolute=self.resp_codes[code],
+                    percentage=self.resp_codes_percs[code],
                 ))
 
-        if self._socket_errors:
+        if self.socket_errors:
             print("\nNetwork errors statistics:")
-            for e in self._socket_errors:
+            for e in self.socket_errors:
                 print(perc_fmt.format(
                     header=str(e),
-                    absolute=self._socket_errors[e],
-                    percentage=self._socket_errors_percs[e],
+                    absolute=self.socket_errors[e],
+                    percentage=self.socket_errors_percs[e],
                 ))
+
     def finalize(self):
-        self._main_stats["lost"] += len(self._pending_queue)
+        self.main_stats["lost"] += len(self._pending_queue)
 
         # we treat lost as failed, but not all failed are lost
-        self._main_stats["failed"] += len(self._pending_queue)
+        self.main_stats["failed"] += len(self._pending_queue)
 
-        if self._main_stats["sent"] > 0:
-            self._main_stats["loss_perc"] = float(self._main_stats["lost"]) / float(self._main_stats["sent"]) * 100.0
+        if self.main_stats["sent"] > 0:
+            self.main_stats["loss_perc"] = float(self.main_stats["lost"]) / float(self.main_stats["sent"]) * 100.0
         else:
-            self._main_stats["loss_perc"] = 100.0
+            self.main_stats["loss_perc"] = 100.0
 
-        self._main_stats["min_latency"] = min(self._received_queue) if self._received_queue else float("inf")
-        self._main_stats["max_latency"] = max(self._received_queue) if self._received_queue else float("-inf")
+        self.main_stats["min_latency"] = min(self._received_queue) if self._received_queue else float("inf")
+        self.main_stats["max_latency"] = max(self._received_queue) if self._received_queue else float("-inf")
 
-        self._main_stats["max_jitter"] = self._main_stats["max_latency"] - self._main_stats["min_latency"] \
+        self.main_stats["max_jitter"] = self.main_stats["max_latency"] - self.main_stats["min_latency"] \
             if self._received_queue else float("inf")
-        self._main_stats["avg_latency"] = mean(self._received_queue) if self._received_queue else float("inf")
-        self._main_stats["std_deviation"] = stdev(self._received_queue) if len(self._received_queue) > 1 else 0.0
+        self.main_stats["avg_latency"] = mean(self._received_queue) if self._received_queue else float("inf")
+        self.main_stats["std_deviation"] = stdev(self._received_queue) if len(self._received_queue) > 1 else 0.0
 
-        for code in self._resp_codes:
-            self._resp_codes_percs[code] = self._resp_codes[code] / float(self._main_stats["sent"]) * 100.0
+        for code in self.resp_codes:
+            self.resp_codes_percs[code] = self.resp_codes[code] / float(self.main_stats["sent"]) * 100.0
             if  self.c.neg_resp_is_fail and code >= 400:
-                self._main_stats["failed"] += self._resp_codes[code]
+                self.main_stats["failed"] += self.resp_codes[code]
 
-        for code in self._socket_errors:
-            self._socket_errors_percs[code] = self._resp_codes[code] / float(self._main_stats["sent"]) * 100.0
+        for code in self.socket_errors:
+            self.socket_errors_percs[code] = self.resp_codes[code] / float(self.main_stats["sent"]) * 100.0
 
-        self._main_stats["passed"] = self._main_stats["sent"] - self._main_stats["failed"]
-        self._main_stats["failed_perc"] = self._main_stats["failed"] / float(self._main_stats["sent"]) * 100.0
-        self._main_stats["passed_perc"] = self._main_stats["passed"] / float(self._main_stats["sent"]) * 100.0
-        self._main_stats["malformed_perc"] = self._main_stats["malformed"] / float(self._main_stats["sent"]) * 100.0
-        self._main_stats["reordered_perc"] = self._main_stats["reordered"] / float(self._main_stats["sent"]) * 100.0
+        self.main_stats["passed"] = self.main_stats["sent"] - self.main_stats["failed"]
+        self.main_stats["failed_perc"] = self.main_stats["failed"] / float(self.main_stats["sent"]) * 100.0
+        self.main_stats["passed_perc"] = self.main_stats["passed"] / float(self.main_stats["sent"]) * 100.0
+        self.main_stats["malformed_perc"] = self.main_stats["malformed"] / float(self.main_stats["sent"]) * 100.0
+        self.main_stats["reordered_perc"] = self.main_stats["reordered"] / float(self.main_stats["sent"]) * 100.0
 
         if self.c.fail_perc:
-            self._main_stats["overall_result"] = True if self._main_stats["failed_perc"] < self.c.fail_perc else False
+            self.main_stats["overall_result"] = True if self.main_stats["failed_perc"] < self.c.fail_perc else False
         elif self.c.fail_count:
-            self._main_stats["overall_result"] = True if self._main_stats["failed"] < self.c.fail_count else False
+            self.main_stats["overall_result"] = True if self.main_stats["failed"] < self.c.fail_count else False
         else:
-            self._main_stats["overall_result"] = True if self._main_stats["failed"] < self._main_stats["passed"] \
+            self.main_stats["overall_result"] = True if self.main_stats["failed"] < self.main_stats["passed"] \
                                                  else False
 
 
@@ -808,7 +809,7 @@ def finish():
     stats.finalize()
     stats.pretty_print()
 
-    if stats._main_stats["overall_result"]:
+    if stats.main_stats["overall_result"]:
        exit(0)
     else:
        exit(1)
