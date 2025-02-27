@@ -443,11 +443,14 @@ class Statistics(metaclass=Singleton):
 
     def mark_received(self, single_result: SingleResult):
         try:
-            self._received_queue.append(single_result.rtt)
-            self.main_stats["received"] += 1
-            if single_result.cseq < self._last_sent_cseq:
-                self.main_stats["reordered"] += 1
-        except KeyError:
+            if not single_result.receive_status == "malformed":
+                self._received_queue.append(single_result.rtt)
+                if single_result.cseq < self._last_sent_cseq:
+                    self.main_stats["reordered"] += 1
+                self.main_stats["received"] += 1
+            else:
+                self.main_stats["malformed"] += 1
+        except (KeyError, TypeError):
             self.main_stats["malformed"] += 1
 
         if single_result.response_code:
@@ -466,9 +469,6 @@ class Statistics(metaclass=Singleton):
                 self.socket_errors[error_reason] += 1
             except KeyError:
                 self.socket_errors[error_reason] = 1
-
-    def increment_malformed(self):
-        self.main_stats["malformed"] += 1
 
     def pretty_print(self):
         perc_fmt = "{header:26s} {absolute:12d} / {percentage:0.3f}%"
@@ -610,25 +610,37 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
                 else:
                     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_DONTFRAG, 1)
 
-    def datagram_received(self, data, addr):
-        """
-        for UDP handler
-        """
+    def _data_receiver_func(self, data, addr):
         data_length = len(data)
         suffix = "s" if len(data) > 1 else ""
 
         single_result = self.parse_received_data(data)
         self.stats.mark_received(single_result)
         host, port, *_ = addr
-        print(self._response_message.format(
-            data_length=data_length,
-            suffix=suffix,
-            endpoint=f"{host}:{port}" if self._address_family == socket.AF_INET else f"[{host}]:{port}",
-            status_line=single_result.status_line,
-            rtt=single_result.rtt)
-        )
+        if single_result.receive_status != "malformed":
+            print(self._response_message.format(
+                data_length=data_length,
+                suffix=suffix,
+                endpoint=f"{host}:{port}" if self._address_family == socket.AF_INET else f"[{host}]:{port}",
+                status_line=single_result.status_line,
+                rtt=single_result.rtt)
+            )
+        else:
+            print("Warning - malformed response received")
         if self.c.verbose_mode:
             print(f"Raw response:", data.decode())
+
+    def datagram_received(self, data, addr):
+        """
+        for UDP handler
+        """
+        self._data_receiver_func(data, addr)
+
+    def data_received(self, data):
+        """
+        for TCP handler
+        """
+        self._data_receiver_func(data, (self.dst_addr, self.dst_port))
 
     def parse_received_data(self, data):
         result = SingleResult()
@@ -649,14 +661,14 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
         # because we use unique cseq and operate only with SIP OPTIONS, we can skip analyzing
         try:
             result.cseq = int(CSEQ_REGEX.search(content).group(1))
+            send_time = self.stats.get_send_time_for_cseq(result.cseq)
+            if send_time:
+                result.rtt = receive_time - send_time
+                result.receive_status = "ok"
+            else:
+                result.receive_status = "unknown"
         except (ValueError, AttributeError):
             result.receive_status = "malformed"
-        send_time = self.stats.get_send_time_for_cseq(result.cseq)
-        if send_time:
-            result.rtt = receive_time - send_time
-            result.receive_status = "ok"
-        else:
-            result.receive_status = "unknown"
         return result
 
     def error_received(self, exc):
@@ -726,26 +738,6 @@ class SIPOptionsTCPHandler(SIPOptionsBaseHandler):
     def _send(self, message):
         self.transport.write(message.encode())
 
-
-    def data_received(self, data):
-        """
-        for TCP handler
-        """
-        data_length = len(data)
-        suffix = "s" if len(data) > 1 else ""
-
-        single_result = self.parse_received_data(data)
-        self.stats.mark_received(single_result)
-        print(self._response_message.format(
-            data_length=data_length,
-            suffix=suffix,
-            endpoint=f"{self.c.dst_host}:{self.c.dst_port}" if self._address_family == socket.AF_INET \
-                     else f"[{self.c.dst_host}]:{self.c.dst_port}",
-            status_line=single_result.status_line,
-            rtt=single_result.rtt)
-        )
-        if self.c.verbose_mode:
-            print(f"Raw response:", data.decode())
 
 async def main():
     # Get a reference to the event loop as we plan to use
