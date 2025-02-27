@@ -163,7 +163,7 @@ class Config(metaclass=Singleton):
         )
 
         ap.add_argument(
-            "-f",
+            "-F",
             dest="neg_resp_is_fail",
             help="Treat 4xx, 5xx, 6xx responses as failure (default no)",
             action="store_true"
@@ -528,6 +528,10 @@ class Statistics(metaclass=Singleton):
                 ))
 
     def finalize(self):
+        if not self.main_stats["sent"]:
+            self.main_stats["overall_result"] = False
+            return
+
         self.main_stats["lost"] += len(self._pending_queue)
 
         # we treat lost as failed, but not all failed are lost
@@ -630,16 +634,18 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
         result = SingleResult()
         receive_time = time.time()
         content = data.decode()
-        raw_status_line, other_headers = content.split("\r\n",maxsplit=1)
-        result.raw_data = content
-
         try:
-            _, resp_code, resp_text = raw_status_line.split(" ", maxsplit=2)
-            result.response_code = int(resp_code)
-            result.status_line = raw_status_line
-        except (IndexError, ValueError):
+            raw_status_line, other_headers = content.split("\r\n",maxsplit=1)
+            try:
+                _, resp_code, resp_text = raw_status_line.split(" ", maxsplit=2)
+                result.response_code = int(resp_code)
+                result.status_line = raw_status_line
+            except (IndexError, ValueError):
+                result.receive_status = "malformed"
+        except ValueError:
             result.receive_status = "malformed"
 
+        result.raw_data = content
         # because we use unique cseq and operate only with SIP OPTIONS, we can skip analyzing
         try:
             result.cseq = int(CSEQ_REGEX.search(content).group(1))
@@ -792,8 +798,9 @@ async def main():
                 local_addr=(c.bind_addr, c.bind_port) if c.bind_addr else None,
                 ssl=ssl_context,
             )
-        except ssl.SSLError as e:
-            print
+        except (ssl.SSLError, socket.error, OSError) as e:
+            print(f"Fatal error during connect to {c.dst_host}:{c.dst_port}:\n{str(e)}")
+            exit(1)
 
 
     try:
