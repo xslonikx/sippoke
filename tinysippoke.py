@@ -11,6 +11,7 @@ import re
 
 from abc import abstractmethod
 from statistics import mean, stdev
+from signal import SIGINT, SIGTERM
 
 VERSION = "0.0.1"
 TOOL_DESCRIPTION = "sippoke is small tool that sends SIP OPTIONS requests to remote host and calculates latency."
@@ -24,10 +25,9 @@ DFL_SEND_PAUSE = 0.5
 DFL_PAYLOAD_SIZE = 600  # bytes
 DFL_FROM_USER = "sippoke"
 DFL_TO_USER = "options"
+DFL_CSEQ = 1
 DFL_TLS_SEC_LEVEL = 3
 FAIL_EXIT_CODE = 1
-START_CSEQ = 1
-END_CSEQ = 2147483646   # 2*31 - 1 as max possible cseq, as SIP 3261 tells
 CA_PATH_DARWIN = "/etc/ssl/cert.pem"
 CA_PATH_LINUX = "/etc/ssl/certs/ca-certificates.crt"   # Debian/Ubuntu path. Temporary path
 
@@ -70,11 +70,11 @@ SEND_MESSAGE_IPV6 = ("\nSent  #{current_req_count} :: {msglen:6} byte{suffix} me
 
 SPLIT_URI_REGEX = re.compile(
     "(?:(?P<user>[\w.]+):?(?P<password>[\w.]+)?@)?\[?(?P<host>(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|"
-    "\[(?:(?:[0-9a-fA-F]{1,4}:){1,7}:{0,1}[0-9a-fA-F]{0,4}\])|(?:(?:[0-9A-Za-z]+\.)+[0-9A-Za-z]+)){0,1}\]?"
+    "\[(?:(?:[0-9a-fA-F]{1,4}:){1,7}:{0,1}[0-9a-fA-F]{0,4}\])|(?:(?:[0-9A-Za-z\-]+\.)+[0-9A-Za-z\-]+)){0,1}\]?"
     ":?(?P<port>\d{1,6})?"
 )
 
-CSEQ_REGEX = re.compile(r"CSeq: (\d+)", re.IGNORECASE | re.MULTILINE)
+SEQNUM_REGEX = re.compile(r"(?:Call-ID|i): .*_(\d+)", re.IGNORECASE | re.MULTILINE)
 
 # Unfortunately, Python2.7 has no these definitions in socket module
 # Linux-specific definitions, taken from Linux in.h file
@@ -84,6 +84,16 @@ IP_PMTUDISC_WANT = 1  # Use per route hints
 IP_PMTUDISC_DO = 2  # Always DF
 IP_PMTUDISC_PROBE = 3  # Ignore dst pmtu
 
+ALL_POSSIBLE_TLS_VERSIONS = {
+    "SSLv2": getattr(ssl.TLSVersion, "SSLv2", None),
+    "SSLv3": getattr(ssl.TLSVersion, "SSLv3", None),
+    "TLSv1.0": getattr(ssl.TLSVersion, "TLSv1", None),
+    "TLSv1.1": getattr(ssl.TLSVersion, "TLSv1_1", None),
+    "TLSv1.2": ssl.TLSVersion.TLSv1_2,
+    "TLSv1.3": ssl.TLSVersion.TLSv1_3,
+}
+
+AVAILABLE_TLS_VERSIONS = {k: v for k, v in ALL_POSSIBLE_TLS_VERSIONS.items() if v is not None }
 
 def determine_ca_certs_path():
     if platform.system() == "Darwin":
@@ -108,8 +118,8 @@ class Config(metaclass=Singleton):
     dst_host = ""  # value is to be filled below
     dst_port = DFL_SIP_PORT  # value may be redefined below
     bind_addr = ""
-    bind_port = 0
-    count = END_CSEQ
+    bind_port = 0   # means any available source port
+    count = 0
     timeout = DFL_PING_TIMEOUT
     proto = "udp"
     verbose_mode = False
@@ -120,7 +130,8 @@ class Config(metaclass=Singleton):
     from_user = DFL_FROM_USER
     to_user = DFL_TO_USER
     tls_sec_level = DFL_TLS_SEC_LEVEL
-    tls_no_verify_cert=False
+    tls_no_verify_cert_totally=False
+    tls_no_verify_cert_hostname_ca=False
     from_uri = None    # will be set later
     to_uri = None   # will be set later
     ca_certs_path = ssl.get_default_verify_paths().cafile
@@ -146,6 +157,7 @@ class Config(metaclass=Singleton):
         exit_nonzero_opts = ap.add_mutually_exclusive_group(required=False)
         tls_opts = ap.add_argument_group(title="TLS Options", description="make sense only with TLS protocol")
         sip_uri_opts = ap.add_argument_group(title="Custom SIP URI options")
+        tls_verify_opts = tls_opts.add_mutually_exclusive_group(required=False)
 
         ap.add_argument(
             "destination",
@@ -159,7 +171,7 @@ class Config(metaclass=Singleton):
             dest="count",
             help="Number of requests, 0 for infinite ping (default)",
             type=int,
-            default=END_CSEQ
+            default=0
         )
 
         ap.add_argument(
@@ -222,22 +234,6 @@ class Config(metaclass=Singleton):
             default=DFL_SIP_TRANSPORT,
         )
 
-        sip_uri_opts.add_argument(
-            "-Rf",
-            dest="field_from",
-            help="SIP From: and Contact: URI",
-            type=str,
-            action="store",
-        )
-
-        sip_uri_opts.add_argument(
-            "-Rt",
-            dest="field_to",
-            help="SIP To: and R-URI",
-            type=str,
-            action="store",
-        )
-
         ap.add_argument(
             "-s",
             dest="payload_size",
@@ -257,13 +253,23 @@ class Config(metaclass=Singleton):
         )
 
         tls_opts.add_argument(
-            "-Tl",
-            dest="tls_sec_level",
-            choices=[0, 1, 2, 3, 4, 5],
-            help="OpenSSL security level - more is secure. Zero means enabling all insecure ciphers",
-            type=int,
+            "-Tm",
+            dest="tls_minimum_version",
+            choices=AVAILABLE_TLS_VERSIONS.keys(),
+            help="Minimum TLS version to use (depends of OS configuration)",
+            type=str,
             action="store",
-            default=3
+            default="TLSv1.2"
+        )
+
+        tls_opts.add_argument(
+            "-TM",
+            dest="tls_maximum_version",
+            choices=AVAILABLE_TLS_VERSIONS.keys(),
+            help="Maximum TLS version to use (depends of OS configuration)",
+            type=str,
+            action="store",
+            default="TLSv1.3"
         )
 
         tls_opts.add_argument(
@@ -275,14 +281,21 @@ class Config(metaclass=Singleton):
             default=determine_ca_certs_path()
         )
 
-        tls_opts.add_argument(
-            "-Ti",
-            dest="tls_no_verify_cert",
-            help="Do not verify Server TLS certificate",
+        tls_verify_opts.add_argument(
+            "-Tx",
+            dest="tls_no_verify_cert_totally",
+            help="Do not verify Server TLS certificate at all, any certificate is valid",
             action="store_true",
         )
 
-        tls_opts.add_argument(
+        tls_verify_opts.add_argument(
+            "-Th",
+            dest="tls_no_verify_cert_hostname_ca",
+            help="Do not verify hostname and CA in Server TLS certificate, but keep verifying the dates",
+            action="store_true",
+        )
+
+        sip_uri_opts.add_argument(
             "-tU",
             dest="to_uri",
             help="Custom URI for Sip To: header (they may differ with actual destination)",
@@ -291,7 +304,7 @@ class Config(metaclass=Singleton):
             default="",
         )
 
-        tls_opts.add_argument(
+        sip_uri_opts.add_argument(
             "-fU",
             dest="from_uri",
             help="Custom URI for Sip From: header (they may differ with actual source)",
@@ -349,7 +362,10 @@ class Config(metaclass=Singleton):
         self.pause_between_transmits = args.pause_between_transmits
         self.payload_size = args.payload_size
         self.dont_set_df_bit = args.dont_set_df_bit
-        self.tls_sec_level = args.tls_sec_level
+        self.tls_no_verify_cert_totally = False
+        self.tls_no_verify_cert_hostname_ca = False
+        self.tls_maximum_version = None
+        self.tls_minimum_version = None
         self.ca_certs_path = args.ca_certs_path
         self.to_uri = args.to_uri
         self.from_uri = args.from_uri
@@ -393,13 +409,18 @@ class Config(metaclass=Singleton):
         if not self.to_uri:
             self.to_uri = f"{to_username}@{self.dst_host}:{self.dst_port}"
 
+        self.tls_no_verify_cert_totally = args.tls_no_verify_cert_totally
+        self.tls_no_verify_cert_hostname_ca = args.tls_no_verify_cert_hostname_ca
+        self.tls_minimum_version = args.tls_minimum_version
+        self.tls_maximum_version = args.tls_maximum_version
+
 
 class SingleResult:
     def __init__(self):
         self.raw_data = None
         self.response_code = None
         self.status_line = None
-        self.cseq = None
+        self.seqnum = None
         self.rtt = None
         self.error_string = None
         self.receive_status = ""
@@ -413,10 +434,15 @@ class Statistics(metaclass=Singleton):
             "sent": 0,
             "received": 0,
             "lost": 0,
+            "passed": 0,
+            "passed_perc": 0.0,
             "failed": 0,
+            "failed_perc": 0.0,
             "malformed": 0,
+            "malformed_perc": 0.0,
             "reordered": 0,
-            "loss_percent": 100.0,
+            "reordered_perc": 0.0,
+            "lost_perc": 100.0,
             "min_latency": float("inf"),
             "max_latency": -float("inf"),
             "avg_latency": float("inf"),
@@ -429,23 +455,23 @@ class Statistics(metaclass=Singleton):
         self.socket_errors = {}
         self.socket_errors_percs = {}
 
-        self._current_cseq = START_CSEQ
-        self._last_sent_cseq = START_CSEQ
+        self.current_seqnum = 0
+        self._last_sent_seqnum= 0
 
-    def add_to_queue(self, cseq: int, start_time: float):
-        self._pending_queue[cseq] = start_time
+    def add_to_queue(self, seqnum: int, start_time: float):
+        self._pending_queue[seqnum] = start_time
         self.main_stats["sent"] += 1
 
-    def get_cseq(self) -> int:
-        self._last_sent_cseq = self._current_cseq
-        self._current_cseq += 1
-        return self._last_sent_cseq
+    def get_seqnum(self) -> int:
+        self._last_sent_seqnum = self.current_seqnum
+        self.current_seqnum += 1
+        return self._last_sent_seqnum
 
     def mark_received(self, single_result: SingleResult):
         try:
             if not single_result.receive_status == "malformed":
                 self._received_queue.append(single_result.rtt)
-                if single_result.cseq < self._last_sent_cseq:
+                if single_result.seqnum < self._last_sent_seqnum:
                     self.main_stats["reordered"] += 1
                 self.main_stats["received"] += 1
             else:
@@ -459,7 +485,7 @@ class Statistics(metaclass=Singleton):
             except KeyError:
                 self.resp_codes[single_result.response_code] = 1
 
-    def get_send_time_for_cseq(self, cseq: int) -> float:
+    def get_send_time_for_seqnum(self, cseq: int) -> float:
         cseq_time = self._pending_queue.pop(cseq)
         return cseq_time
 
@@ -480,7 +506,7 @@ class Statistics(metaclass=Singleton):
         print(perc_fmt.format(
             header="Requests received:",
             absolute=self.main_stats["received"],
-            percentage=100.0 - self.main_stats["loss_perc"],
+            percentage=100.0 - self.main_stats["lost_perc"],
         ))
         print("\nStatistics:")
         print(perc_fmt.format(
@@ -496,7 +522,7 @@ class Statistics(metaclass=Singleton):
         print(perc_fmt.format(
             header="Lost:",
             absolute=self.main_stats["lost"],
-            percentage=self.main_stats["loss_perc"],
+            percentage=self.main_stats["lost_perc"],
         ))
         print(perc_fmt.format(
             header="Reordered:",
@@ -538,9 +564,9 @@ class Statistics(metaclass=Singleton):
         self.main_stats["failed"] += len(self._pending_queue)
 
         if self.main_stats["sent"] > 0:
-            self.main_stats["loss_perc"] = float(self.main_stats["lost"]) / float(self.main_stats["sent"]) * 100.0
+            self.main_stats["lost_perc"] = float(self.main_stats["lost"]) / float(self.main_stats["sent"]) * 100.0
         else:
-            self.main_stats["loss_perc"] = 100.0
+            self.main_stats["lost_perc"] = 100.0
 
         self.main_stats["min_latency"] = min(self._received_queue) if self._received_queue else float("inf")
         self.main_stats["max_latency"] = max(self._received_queue) if self._received_queue else float("-inf")
@@ -613,8 +639,10 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
     def _data_receiver_func(self, data, addr):
         data_length = len(data)
         suffix = "s" if len(data) > 1 else ""
-
         single_result = self.parse_received_data(data)
+        if self.c.verbose_mode:
+            print(f"\n--- Raw response:")
+            print(data.decode())
         self.stats.mark_received(single_result)
         host, port, *_ = addr
         if single_result.receive_status != "malformed":
@@ -627,8 +655,6 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
             )
         else:
             print("Warning - malformed response received")
-        if self.c.verbose_mode:
-            print(f"Raw response:", data.decode())
 
     def datagram_received(self, data, addr):
         """
@@ -649,9 +675,10 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
         try:
             raw_status_line, other_headers = content.split("\r\n",maxsplit=1)
             try:
-                _, resp_code, resp_text = raw_status_line.split(" ", maxsplit=2)
-                result.response_code = int(resp_code)
-                result.status_line = raw_status_line
+                protocol, resp_code, resp_text = raw_status_line.split(" ", maxsplit=2)
+                if "SIP" in protocol:
+                    result.response_code = int(resp_code)
+                    result.status_line = raw_status_line
             except (IndexError, ValueError):
                 result.receive_status = "malformed"
         except ValueError:
@@ -659,16 +686,17 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
 
         result.raw_data = content
         # because we use unique cseq and operate only with SIP OPTIONS, we can skip analyzing
-        try:
-            result.cseq = int(CSEQ_REGEX.search(content).group(1))
-            send_time = self.stats.get_send_time_for_cseq(result.cseq)
-            if send_time:
-                result.rtt = receive_time - send_time
-                result.receive_status = "ok"
-            else:
-                result.receive_status = "unknown"
-        except (ValueError, AttributeError):
-            result.receive_status = "malformed"
+        #try:
+        groups = SEQNUM_REGEX.search(content).groups()
+        result.seqnum = int(SEQNUM_REGEX.search(content).group(1))
+        send_time = self.stats.get_send_time_for_seqnum(result.seqnum)
+        if send_time:
+            result.rtt = receive_time - send_time
+            result.receive_status = "ok"
+        else:
+            result.receive_status = "unknown"
+        #except (ValueError, AttributeError):
+        #    result.receive_status = "malformed"
         return result
 
     def error_received(self, exc):
@@ -679,7 +707,7 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
         self.on_con_lost.set_result(True)
 
     def create_request(self):
-        cseq = self.stats.get_cseq()
+        seqnum = self.stats.get_seqnum()
         req_string = f"OPTIONS sip:{self.c.to_uri} SIP/2.0"
         message = "\r\n".join([
             req_string,
@@ -687,8 +715,8 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
             f"Max-Forwards: 70",
             f"To: <sip:{self.c.to_uri}>",
             f"From: <sip:{self.c.from_uri}>;tag={uuid.uuid4()}",
-            f"Call-ID: {uuid.uuid4()}",
-            f"CSeq: {cseq} OPTIONS",
+            f"Call-ID: {uuid.uuid4()}_{seqnum}",
+            f"CSeq: {DFL_CSEQ} OPTIONS",
             f"Contact: <sip:{self.c.from_uri}>;transport={self.c.proto.lower()}",
             "P-SipPoke-Payload: {}",
             "Content-Length: 0",
@@ -701,33 +729,33 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
         needed_payload_length = needed_payload_length if needed_payload_length > 0 else 0
         payload = PAYLOAD_PATTERN[:needed_payload_length]
         message = message.format(payload)
-        return req_string, cseq, message
+        return req_string, seqnum, message
 
     @abstractmethod
     def _send(self, message):
+        """
+        Abstraction for actual sending method that differs in tcp and udp case
+        """
         pass
 
-    async def send_loop(self):
-        while True:
-            send_time = time.time()
-            req_string, cseq, message = self.create_request()
-            self._send(message)
-            snd_msg = self._send_message.format(
-                msglen=len(message),
-                suffix="s" if len(message) > 1 else "",
-                endpoint=f"{self.c.dst_host}:{self.c.dst_port}",
-                current_req_count=self.current_req_count,
-                req_string=req_string
-            )
-            print(snd_msg)
-            if self.c.verbose_mode:
-                print("Raw request", message)
-            self.stats.add_to_queue(cseq, send_time)
-            self.current_req_count += 1
-            await asyncio.sleep(self.c.pause_between_transmits)
-            if self.current_req_count == self.c.count:
-                break
+    def send(self):
+        send_time = time.time()
+        req_string, cseq, message = self.create_request()
+        self._send(message)
+        if self.c.verbose_mode:
+            print("\n--- Raw request")
+            print(message)
+        snd_msg = self._send_message.format(
+            msglen=len(message),
+            suffix="s" if len(message) > 1 else "",
+            endpoint=f"{self.c.dst_host}:{self.c.dst_port}",
+            current_req_count=self.current_req_count,
+            req_string=req_string
+        )
 
+        print(snd_msg)
+        self.stats.add_to_queue(cseq, send_time)
+        self.current_req_count += 1
 
 class SIPOptionsUDPHandler(SIPOptionsBaseHandler):
     def _send(self, message):
@@ -739,6 +767,39 @@ class SIPOptionsTCPHandler(SIPOptionsBaseHandler):
         self.transport.write(message.encode())
 
 
+async def send_loop(protocol):
+    c = Config()
+    s = Statistics()
+    try:
+        if not c.count:
+            while True:
+                protocol.send()
+                await asyncio.sleep(c.pause_between_transmits)
+        else:
+            while s.current_seqnum < c.count:
+                protocol.send()
+                await asyncio.sleep(c.pause_between_transmits)
+    except asyncio.CancelledError:
+        print("TEST Cancelled")
+
+
+async def stop_send_loop(loop, task):
+    try:
+        await task
+    except KeyboardInterrupt:
+        task.cancel()  # Cancel the running task gracefully
+        await asyncio.gather(task, return_exceptions=True)
+    finally:
+        finish()
+
+def finish():
+    print("\n=========== FINISHED ===========")
+    stats = Statistics()
+    stats.finalize()
+    stats.pretty_print()
+
+
+
 async def main():
     # Get a reference to the event loop as we plan to use
     # low-level APIs.
@@ -747,6 +808,7 @@ async def main():
     transport = None
     protocol = None
     c = Config()
+    s = Statistics()
 
     # primitive check for ipv6 address format
     dst_repr = f"{c.dst_host}:{c.dst_port}" if ":" not in c.dst_host else f"[{c.dst_host}]:{c.dst_port}"
@@ -779,9 +841,23 @@ async def main():
     elif c.proto == "tls":
         ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ssl_context.load_verify_locations(c.ca_certs_path)
-        if c.tls_no_verify_cert:
-            ssl_context.verify_mode = ssl.CERT_NONE
+
+        if c.tls_no_verify_cert_totally:
             ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        elif c.tls_no_verify_cert_hostname_ca:
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_OPTIONAL
+
+        try:
+            if c.tls_maximum_version:
+                ssl_context.maximum_version = AVAILABLE_TLS_VERSIONS[c.tls_maximum_version]
+            if c.tls_maximum_version:
+                ssl_context.minimum_version = AVAILABLE_TLS_VERSIONS[c.tls_minimum_version]
+        except ValueError as e:
+            print(f"Fatal error during connect to {c.dst_host}:{c.dst_port}:\n{str(e)}")
+            exit(1)
+
         try:
             transport, protocol = await loop.create_connection(
                 lambda: SIPOptionsTCPHandler(on_con_lost=on_con_lost),
@@ -794,30 +870,17 @@ async def main():
             print(f"Fatal error during connect to {c.dst_host}:{c.dst_port}:\n{str(e)}")
             exit(1)
 
+    task = loop.create_task(send_loop(protocol))
+    await stop_send_loop(loop, task)
 
-    try:
-        await protocol.send_loop()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        transport.close()
-
-def finish():
-    print("\n=========== FINISHED ===========")
-    stats = Statistics()
-    stats.finalize()
-    stats.pretty_print()
-
-    if stats.main_stats["overall_result"]:
-       exit(0)
-    else:
-       exit(1)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        finish()
+    except (asyncio.exceptions.CancelledError, KeyboardInterrupt):
+        pass
+
+
 
 
 
