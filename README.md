@@ -1,5 +1,5 @@
 # tinysippoke
-Tiny SIP Poke - Small script which can perform simple SIP OPTIONS ping and read 
+SIP Poke - Small script which can perform simple SIP OPTIONS ping and read 
 response. Further development of [Tinysipping](https://github.com/xslonikx/tinysipping) tool.  
   
 Deliberately written in python3.8 style without external dependencies for compatibility with clean installations of 
