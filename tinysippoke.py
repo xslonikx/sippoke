@@ -781,7 +781,8 @@ async def send_loop(protocol):
                 await asyncio.sleep(c.pause_between_transmits)
     except asyncio.CancelledError:
         print("TEST Cancelled")
-
+    finally:
+        pass
 
 async def stop_send_loop(loop, task):
     try:
@@ -790,14 +791,14 @@ async def stop_send_loop(loop, task):
         task.cancel()  # Cancel the running task gracefully
         await asyncio.gather(task, return_exceptions=True)
     finally:
-        finish()
+        show_statistics()
 
-def finish():
+
+def show_statistics():
     print("\n=========== FINISHED ===========")
     stats = Statistics()
     stats.finalize()
     stats.pretty_print()
-
 
 
 async def main():
@@ -855,7 +856,7 @@ async def main():
             if c.tls_maximum_version:
                 ssl_context.minimum_version = AVAILABLE_TLS_VERSIONS[c.tls_minimum_version]
         except ValueError as e:
-            print(f"Fatal error during connect to {c.dst_host}:{c.dst_port}:\n{str(e)}")
+            print(f"Fatal error:\n{str(e)}")
             exit(1)
 
         try:
@@ -867,18 +868,26 @@ async def main():
                 ssl=ssl_context,
             )
         except (ssl.SSLError, socket.error, OSError) as e:
-            print(f"Fatal error during connect to {c.dst_host}:{c.dst_port}:\n{str(e)}")
+            print(f"Fatal error :\n{str(e)}")
             exit(1)
 
     task = loop.create_task(send_loop(protocol))
-    await stop_send_loop(loop, task)
+    try:
+        await stop_send_loop(loop, task)
+    finally:
+        transport.close()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (asyncio.exceptions.CancelledError, KeyboardInterrupt):
+    except KeyboardInterrupt:
+        print("\nInterrupted")
+    except asyncio.exceptions.CancelledError:
         pass
+    except (ssl.SSLError, socket.error, OSError) as e:
+        print(f"Fatal error:\n{str(e)}")
+        exit(1)
 
 
 
