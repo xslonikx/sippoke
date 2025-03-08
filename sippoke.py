@@ -69,9 +69,9 @@ SEND_MESSAGE_IPV6 = ("\nSent  #{current_req_count} :: {msglen:6} byte{suffix} me
                      " {req_string}")
 
 SPLIT_URI_REGEX = re.compile(
-    "(?:(?P<user>[\w.]+):?(?P<password>[\w.]+)?@)?\[?(?P<host>(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|"
-    "\[(?:(?:[0-9a-fA-F]{1,4}:){1,7}:{0,1}[0-9a-fA-F]{0,4}\])|(?:(?:[0-9A-Za-z\-]+\.)+[0-9A-Za-z\-]+)){0,1}\]?"
-    ":?(?P<port>\d{1,6})?"
+    r"(?:(?P<user>[\w.]+):?(?P<password>[\w.]+)?@)?\[?(?P<host>(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|"
+    r"\[(?:(?:[0-9a-fA-F]{1,4}:){1,7}:{0,1}[0-9a-fA-F]{0,4}\])|(?:(?:[0-9A-Za-z\-]+\.)+[0-9A-Za-z\-]+)){0,1}\]?"
+    r":?(?P<port>\d{1,6})?"
 )
 
 SEQNUM_REGEX = re.compile(r"(?:Call-ID|i): .*_(\d+)", re.IGNORECASE | re.MULTILINE)
