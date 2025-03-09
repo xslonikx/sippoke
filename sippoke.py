@@ -1,5 +1,4 @@
 import logging
-import os
 import socket
 import uuid
 import asyncio
@@ -11,9 +10,9 @@ import re
 
 from abc import abstractmethod
 from statistics import mean, stdev
-from signal import SIGINT, SIGTERM
 
-VERSION = "0.0.1"
+
+VERSION = "0.2"
 TOOL_DESCRIPTION = "sippoke is small tool that sends SIP OPTIONS requests to remote host and calculates latency."
 
 MAX_FORWARDS = 70  # times
@@ -26,32 +25,12 @@ DFL_PAYLOAD_SIZE = 600  # bytes
 DFL_FROM_USER = "sippoke"
 DFL_TO_USER = "options"
 DFL_CSEQ = 1
-DFL_TLS_SEC_LEVEL = 3
 FAIL_EXIT_CODE = 1
 CA_PATH_DARWIN = "/etc/ssl/cert.pem"
 CA_PATH_LINUX = "/etc/ssl/certs/ca-certificates.crt"   # Debian/Ubuntu path. Temporary path
 
-WEAK_CIPHERS = (
-    "ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:DHE-RSA-AES256-SHA:GOST2012256-GOST89-GOST89:"
-    "DHE-RSA-CAMELLIA256-SHA:GOST2001-GOST89-GOST89:AES256-SHA:CAMELLIA256-SHA:ECDHE-RSA-AES128-SHA:"
-    "ECDHE-ECDSA-AES128-SHA:DHE-RSA-AES128-SHA:DHE-RSA-CAMELLIA128-SHA:AES128-SHA:CAMELLIA128-SHA:"
-    "ECDHE-RSA-RC4-SHA:ECDHE-ECDSA-RC4-SHA:RC4-SHA:RC4-MD5:ECDHE-RSA-DES-CBC3-SHA:ECDHE-ECDSA-DES-CBC3-SHA:"
-    "EDH-RSA-DES-CBC3-SHA:DES-CBC3-SHA"
-)
-
-DEFAULT_CIPHERS = (
-    "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-CHACHA20-POLY1305:"
-    "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384:"
-    "ECDHE-ECDSA-AES256-SHA384:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-SHA256:DHE-RSA-CAMELLIA256-SHA256:"
-    "AES256-GCM-SHA384:AES256-SHA256:CAMELLIA256-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
-    "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:"
-    "DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES128-SHA256:DHE-RSA-CAMELLIA128-SHA256:AES128-GCM-SHA256:"
-    "AES128-SHA256:CAMELLIA128-SHA256"
-)
-
-ALL_CIPHERS = "{}:{}".format(WEAK_CIPHERS, DEFAULT_CIPHERS)
-
 # length of this phrase * 1489 = totally 65536 bytes -- it's max theoretical size of UDP dgram
+# below we'll slice this string to portions of desired size 
 PAYLOAD_PATTERN = "the_quick_brown_fox_jumps_over_the_lazy_dog_" * 1489
 
 # messages templates for further formatting
@@ -93,15 +72,16 @@ ALL_POSSIBLE_TLS_VERSIONS = {
     "TLSv1.3": ssl.TLSVersion.TLSv1_3,
 }
 
-AVAILABLE_TLS_VERSIONS = {k: v for k, v in ALL_POSSIBLE_TLS_VERSIONS.items() if v is not None }
+# Dynamically getting TLS versions available on the certain system
+AVAILABLE_TLS_VERSIONS = {k: v for k, v in ALL_POSSIBLE_TLS_VERSIONS.items() if v is not None}
 
-def determine_ca_certs_path():
-    if platform.system() == "Darwin":
-        return CA_PATH_DARWIN
-    elif platform.system() == "Linux":
-        return CA_PATH_LINUX
-    else:
-        raise NotImplementedError(f"Unsupported platform: {platform.system()}")
+
+# For compatibility with Windows and Python3.9 and earlier
+# Asyncio uses ProactorEventLoop by default on Windows. In Python releases <3.10 on Windows asyncio.run() doesn't
+# cleanup the event loop properly, which leads to RuntimeError: Event loop is closed error when script finishes the work
+# Explicitly setting WindowsSelectorEventLoopPolicy() helps avoid that
+if platform.system() == "Windows" and int(platform.python_version_tuple()[1]) < 10:
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 class Singleton(type):
@@ -129,7 +109,6 @@ class Config(metaclass=Singleton):
     dont_set_df_bit = False
     from_user = DFL_FROM_USER
     to_user = DFL_TO_USER
-    tls_sec_level = DFL_TLS_SEC_LEVEL
     tls_no_verify_cert_totally=False
     tls_no_verify_cert_hostname_ca=False
     from_uri = None    # will be set later
@@ -137,7 +116,7 @@ class Config(metaclass=Singleton):
     ca_certs_path = ssl.get_default_verify_paths().cafile
     fail_count = None
     fail_perc = None
-    node_name = os.uname().nodename
+    node_name = platform.node()
 
     def __init__(self, args=None):
         self._get_params_from_args(self._prepare_argv_parser().parse_args())
@@ -278,7 +257,7 @@ class Config(metaclass=Singleton):
             help="Custom CA certificates path",
             type=str,
             action="store",
-            default=determine_ca_certs_path()
+            default = ""
         )
 
         tls_verify_opts.add_argument(
@@ -841,7 +820,9 @@ async def main():
 
     elif c.proto == "tls":
         ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ssl_context.load_verify_locations(c.ca_certs_path)
+        if c.ca_certs_path:
+            ssl_context.load_verify_locations(c.ca_certs_path)
+        print("TEST certs", ssl_context.get_ca_certs())
 
         if c.tls_no_verify_cert_totally:
             ssl_context.check_hostname = False
@@ -857,7 +838,7 @@ async def main():
                 ssl_context.minimum_version = AVAILABLE_TLS_VERSIONS[c.tls_minimum_version]
         except ValueError as e:
             print(f"Fatal error:\n{str(e)}")
-            exit(1)
+            exit(FAIL_EXIT_CODE)
 
         try:
             transport, protocol = await loop.create_connection(
@@ -869,7 +850,7 @@ async def main():
             )
         except (ssl.SSLError, socket.error, OSError) as e:
             print(f"Fatal error :\n{str(e)}")
-            exit(1)
+            exit(FAIL_EXIT_CODE)
 
     task = loop.create_task(send_loop(protocol))
     try:
@@ -887,7 +868,7 @@ if __name__ == "__main__":
         pass
     except (ssl.SSLError, socket.error, OSError) as e:
         print(f"Fatal error:\n{str(e)}")
-        exit(1)
+        exit(FAIL_EXIT_CODE)
 
 
 
