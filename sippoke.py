@@ -605,15 +605,18 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
         else:
             logging.fatal("Address family {sock.family} is not supported}")
 
-        if platform.system() == "Linux":
+
+        if self.c.dont_set_df_bit:
+            if platform.system() == "Linux":
             # small platform-specific notices
             # df bit often set on linux systems because pmtu discovery often enabled by default
             # but better not to rely on it and explicitly set and unset this
-            if self.c.dont_set_df_bit:
                 if self._address_family == socket.AF_INET:
                     sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
                 else:
                     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_DONTFRAG, 1)
+            else:
+                print("Warning - Setting DF bit is only supported on Linux. Ignoring.")
 
     def _data_receiver_func(self, data, addr):
         data_length = len(data)
