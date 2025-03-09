@@ -825,7 +825,6 @@ async def main():
         ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         if c.ca_certs_path:
             ssl_context.load_verify_locations(c.ca_certs_path)
-        print("TEST certs", ssl_context.get_ca_certs())
 
         if c.tls_no_verify_cert_totally:
             ssl_context.check_hostname = False
