@@ -868,7 +868,7 @@ async def send_loop(protocol):
                 protocol.send()
                 await asyncio.sleep(c.pause_between_transmits)
     except asyncio.CancelledError:
-        print_with_verbosity("Cancelled", VERBLEVEL_NORMAL)
+        print_with_verbosity("\nCancelled", VERBLEVEL_NORMAL)
     finally:
         pass
 

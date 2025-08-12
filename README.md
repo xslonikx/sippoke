@@ -6,6 +6,12 @@ Deliberately written in python3.8 style without external dependencies for compat
 more or less actual Linux distributions (RHEL-like >8/9, Ubuntu >18.04 etc.)  
   
 ```
+usage: sippoke.py [-h] [-c COUNT] [-F] [-i SRC_SOCK] [-k FAIL_PERC | -K FAIL_COUNT] [-l PAUSE_BETWEEN_TRANSMITS] [-m]
+                  [-p {tcp,udp,tls}] [-s PAYLOAD_SIZE] [-t SOCK_TIMEOUT] [-Tm {SSLv3,TLSv1.0,TLSv1.1,TLSv1.2,TLSv1.3}]
+                  [-TM {SSLv3,TLSv1.0,TLSv1.1,TLSv1.2,TLSv1.3}] [-Tc CA_CERTS_PATH] [-Tx | -Th] [-tU TO_URI]
+                  [-fU FROM_URI] [-v] [-q] [-o {human,json}] [-V]
+                  destination
+
 sippoke is small tool that sends SIP OPTIONS requests to remote host and calculates latency.
 
 positional arguments:
@@ -21,11 +27,14 @@ options:
   -K FAIL_COUNT         Program exits with non-zero code if count of failed requests more than threshold
   -l PAUSE_BETWEEN_TRANSMITS
                         Pause between transmits (default 0.5, 0 for immediate send)
-  -m                    Do not set DF bit (default DF bit is set) - currently works only on Linux
+  -m                    Do not set DF bit (default DF bit is set) - currently works only on Linux (ipv4 and ipv6) and
+                        Windows (ipv4 only)
   -p {tcp,udp,tls}      Protocol (udp, tcp, tls)
   -s PAYLOAD_SIZE       Fill request up to certain size
   -t SOCK_TIMEOUT       Socket timeout in seconds (float, default 1.0)
-  -v                    Verbose mode (show sent and received content)
+  -v                    Verbose mode (shows sent and received messages)
+  -q                    Quiet mode (does not show nothing, only returns exitcode)
+  -o {human,json}       Stats output format (human- or machine-readable). In machine-readable only results get printed
   -V                    show program's version number and exit
 
 TLS Options:
@@ -42,7 +51,6 @@ TLS Options:
 Custom SIP URI options:
   -tU TO_URI            Custom URI for Sip To: header (they may differ with actual destination)
   -fU FROM_URI          Custom URI for Sip From: header (they may differ with actual source)
-
 ```
 
 Example of usage:
@@ -60,7 +68,7 @@ Received       ::    404 bytes response from 127.0.0.1:5060              :: SIP/
 
 Sent  #2       ::    600 bytes message  to   127.0.0.1:5060              :: OPTIONS sip:options@127.0.0.1 SIP/2.0
 Received       ::    404 bytes response from 127.0.0.1:5060              :: SIP/2.0 404 Not Found in 0.001ms
-^CTEST Cancelled
+^CCancelled
 
 =========== FINISHED ===========
 Overall status: FAILED
