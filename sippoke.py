@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+
+import json
 import logging
 import socket
 import uuid
@@ -10,7 +13,6 @@ import re
 
 from abc import abstractmethod
 from statistics import mean, stdev
-
 
 VERSION = "0.2"
 TOOL_DESCRIPTION = "sippoke is small tool that sends SIP OPTIONS requests to remote host and calculates latency."
@@ -25,16 +27,40 @@ DFL_PAYLOAD_SIZE = 600  # bytes
 DFL_FROM_USER = "sippoke"
 DFL_TO_USER = "options"
 DFL_CSEQ = 1
+DFL_TLS_SEC_LEVEL = 3
 FAIL_EXIT_CODE = 1
-CA_PATH_DARWIN = "/etc/ssl/cert.pem"
-CA_PATH_LINUX = "/etc/ssl/certs/ca-certificates.crt"   # Debian/Ubuntu path. Temporary path
+SOCKET_ERROR_EXIT_CODE = 2
+
+VERBLEVEL_NORMAL = 2
+VERBLEVEL_DEBUG = 3
+VERBLEVEL_RESULTS = 1
+VERBLEVEL_FATAL = -1
+
+WEAK_CIPHERS = (
+    "ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:DHE-RSA-AES256-SHA:GOST2012256-GOST89-GOST89:"
+    "DHE-RSA-CAMELLIA256-SHA:GOST2001-GOST89-GOST89:AES256-SHA:CAMELLIA256-SHA:ECDHE-RSA-AES128-SHA:"
+    "ECDHE-ECDSA-AES128-SHA:DHE-RSA-AES128-SHA:DHE-RSA-CAMELLIA128-SHA:AES128-SHA:CAMELLIA128-SHA:"
+    "ECDHE-RSA-RC4-SHA:ECDHE-ECDSA-RC4-SHA:RC4-SHA:RC4-MD5:ECDHE-RSA-DES-CBC3-SHA:ECDHE-ECDSA-DES-CBC3-SHA:"
+    "EDH-RSA-DES-CBC3-SHA:DES-CBC3-SHA"
+)
+
+DEFAULT_CIPHERS = (
+    "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-CHACHA20-POLY1305:"
+    "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384:"
+    "ECDHE-ECDSA-AES256-SHA384:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-SHA256:DHE-RSA-CAMELLIA256-SHA256:"
+    "AES256-GCM-SHA384:AES256-SHA256:CAMELLIA256-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+    "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:"
+    "DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES128-SHA256:DHE-RSA-CAMELLIA128-SHA256:AES128-GCM-SHA256:"
+    "AES128-SHA256:CAMELLIA128-SHA256"
+)
+
+ALL_CIPHERS = "{}:{}".format(WEAK_CIPHERS, DEFAULT_CIPHERS)
 
 # length of this phrase * 1489 = totally 65536 bytes -- it's max theoretical size of UDP dgram
-# below we'll slice this string to portions of desired size 
 PAYLOAD_PATTERN = "the_quick_brown_fox_jumps_over_the_lazy_dog_" * 1489
 
 # messages templates for further formatting
-MSG_DF_BIT_NOT_SUPPORTED = "WARNING: ignoring dont_set_df_bit (-m) option that is not supported by this platform"
+MSG_DF_BIT_NOT_SUPPORTED = f"WARNING: Option -m is not supported on platform {platform.system()}. Skipping."
 MSG_UNABLE_TO_CONNECT = "FATAL: Unable to connect to {}:{}: {}"
 
 RESPONSE_MESSAGE_IPV4 = ("Received       :: {data_length:6} byte{suffix} response from {endpoint:27} :: {status_line}"
@@ -49,10 +75,12 @@ SEND_MESSAGE_IPV6 = ("\nSent  #{current_req_count} :: {msglen:6} byte{suffix} me
 
 SPLIT_URI_REGEX = re.compile(
     r"(?:(?P<user>[\w.]+):?(?P<password>[\w.]+)?@)?\[?(?P<host>(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|"
-    r"\[(?:(?:[0-9a-fA-F]{1,4}:){1,7}:{0,1}[0-9a-fA-F]{0,4}\])|(?:(?:[0-9A-Za-z\-]+\.)+[0-9A-Za-z\-]+)){0,1}\]?"
+    r"\[(?:(?:[0-9a-fA-F]{1,4}:){1,7}:{0,1}[0-9a-fA-F]{0,4}\])|(?:(?:[0-9A-Za-z\-.]+)+[0-9A-Za-z\-]+)){0,1}\]?"
     r":?(?P<port>\d{1,6})?"
 )
 
+# We store the sequence number in Call-ID value. It's not CSeq
+# Earlier implementations used SIP CSeq field, but it led to limitation of max count to ~2B requests (2**31-1)
 SEQNUM_REGEX = re.compile(r"(?:Call-ID|i): .*_(\d+)", re.IGNORECASE | re.MULTILINE)
 
 # Unfortunately, Python2.7 has no these definitions in socket module
@@ -72,16 +100,21 @@ ALL_POSSIBLE_TLS_VERSIONS = {
     "TLSv1.3": ssl.TLSVersion.TLSv1_3,
 }
 
-# Dynamically getting TLS versions available on the certain system
-AVAILABLE_TLS_VERSIONS = {k: v for k, v in ALL_POSSIBLE_TLS_VERSIONS.items() if v is not None}
+AVAILABLE_TLS_VERSIONS = {k: v for k, v in ALL_POSSIBLE_TLS_VERSIONS.items() if v is not None }
+
+def print_with_verbosity(msg, verbosity):
+    if verbosity <= Config().verbosity:
+        print(msg)
 
 
-# For compatibility with Windows and Python3.9 and earlier
-# Asyncio uses ProactorEventLoop by default on Windows. In Python releases <3.10 on Windows asyncio.run() doesn't
-# cleanup the event loop properly, which leads to RuntimeError: Event loop is closed error when script finishes the work
-# Explicitly setting WindowsSelectorEventLoopPolicy() helps avoid that
-if platform.system() == "Windows" and int(platform.python_version_tuple()[1]) < 10:
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+class VerbosityAction(argparse.Action):
+    def __init__(self, option_strings, dest, default=None, required=False, help=None):
+        super().__init__(option_strings, dest, nargs=0, default=default, required=required, help=help)
+        self._base_level = default if default is not None else 0
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        current = getattr(namespace, self.dest, self._base_level)
+        setattr(namespace, self.dest, current + 1)
 
 
 class Singleton(type):
@@ -102,13 +135,14 @@ class Config(metaclass=Singleton):
     count = 0
     timeout = DFL_PING_TIMEOUT
     proto = "udp"
-    verbose_mode = False
+    verbosity = 2
     neg_resp_is_fail = False
     pause_between_transmits = DFL_SEND_PAUSE
     payload_size = DFL_PAYLOAD_SIZE
     dont_set_df_bit = False
     from_user = DFL_FROM_USER
     to_user = DFL_TO_USER
+    tls_sec_level = DFL_TLS_SEC_LEVEL
     tls_no_verify_cert_totally=False
     tls_no_verify_cert_hostname_ca=False
     from_uri = None    # will be set later
@@ -199,7 +233,7 @@ class Config(metaclass=Singleton):
             "-m",
             dest="dont_set_df_bit",
             help="Do not set DF bit (default DF bit is set) "
-                 "- currently works only on Linux",
+                 "- currently works only on Linux (ipv4 and ipv6) and Windows (ipv4 only)",
             action="store_true",
         )
 
@@ -257,7 +291,7 @@ class Config(metaclass=Singleton):
             help="Custom CA certificates path",
             type=str,
             action="store",
-            default = ""
+            default=""
         )
 
         tls_verify_opts.add_argument(
@@ -294,9 +328,28 @@ class Config(metaclass=Singleton):
 
         ap.add_argument(
             "-v",
-            dest="verbose_mode",
-            help="Verbose mode (show sent and received content)",
-            action="store_true"
+            action=VerbosityAction,
+            help="Verbose mode (shows sent and received messages)",
+            default=2,
+            dest="verbosity",
+        )
+
+        ap.add_argument(
+            "-q",
+            dest="quiet_mode",
+            help="Quiet mode (does not show nothing, only returns exitcode)",
+            action="store_true",
+            default=False
+        )
+
+        ap.add_argument(
+            "-o",
+            dest="output_format",
+            choices=["human", "json"],
+            default="human",
+            help="Stats output format (human- or machine-readable). In machine-readable only results get printed",
+            type=str,
+            action="store",
         )
 
         ap.add_argument("-V",
@@ -327,7 +380,6 @@ class Config(metaclass=Singleton):
             "count": (int) Count of requests that are to be sent
             "timeout": (float) Socket timeout
             "proto": Protocol (tcp or udp). Assertion for proto in (tcp, udp)
-            "verbose_mode": (bool) Verbose mode
             "neg_resp_is_fail": (bool) Treat 4xx, 5xx, 6xx responses as fail
         }
         :param args: (argparse.Namespace) argparse CLI arguments
@@ -336,7 +388,6 @@ class Config(metaclass=Singleton):
         self.count = args.count
         self.timeout = args.sock_timeout
         self.proto = args.proto
-        self.verbose_mode = args.verbose_mode
         self.neg_resp_is_fail = args.neg_resp_is_fail
         self.pause_between_transmits = args.pause_between_transmits
         self.payload_size = args.payload_size
@@ -348,6 +399,16 @@ class Config(metaclass=Singleton):
         self.ca_certs_path = args.ca_certs_path
         self.to_uri = args.to_uri
         self.from_uri = args.from_uri
+        self.output_format = args.output_format
+        self.verbosity = args.verbosity
+        self.output_format = args.output_format
+        self.quiet_mode = args.quiet_mode
+
+        # we write results to stdout only in modes different from human-readable to ease further processing
+        if args.output_format != "human":
+            self.verbosity = 1
+        if self.quiet_mode:
+            self.verbosity = 0
 
         try:
             self.fail_count = args.fail_count
@@ -429,6 +490,10 @@ class Statistics(metaclass=Singleton):
             "std_deviation": float("inf"),
         }
 
+        self.final_print = self.pretty_print    # default
+        if self.c.output_format == "json":
+            self.final_print = self.print_json
+
         self.resp_codes = {}
         self.resp_codes_percs = {}
         self.socket_errors = {}
@@ -479,58 +544,71 @@ class Statistics(metaclass=Singleton):
         perc_fmt = "{header:26s} {absolute:12d} / {percentage:0.3f}%"
         float_value_str = "{:22s} {:9.3f}"
         overall_result_message = "PASSED" if self.main_stats["overall_result"] else "FAILED"
-        print(f"Overall status: {overall_result_message}")
-        print(f"Total requests sent: {self.main_stats['sent']:18}")
+        print_with_verbosity(f"Overall status: {overall_result_message}", VERBLEVEL_NORMAL)
+        print_with_verbosity(f"Total requests sent: {self.main_stats['sent']:18}", VERBLEVEL_NORMAL)
 
-        print(perc_fmt.format(
+        reqs_received_str = perc_fmt.format(
             header="Requests received:",
             absolute=self.main_stats["received"],
             percentage=100.0 - self.main_stats["lost_perc"],
-        ))
-        print("\nStatistics:")
-        print(perc_fmt.format(
+        )
+        print_with_verbosity(reqs_received_str, VERBLEVEL_NORMAL)
+        print_with_verbosity("\nStatistics:", VERBLEVEL_NORMAL)
+
+        passed_str = perc_fmt.format(
             header="Requests passed:",
             absolute=self.main_stats["passed"],
             percentage=self.main_stats["passed_perc"],
-        ))
-        print(perc_fmt.format(
+        )
+        print_with_verbosity(passed_str, VERBLEVEL_NORMAL)
+
+        failed_str =perc_fmt.format(
             header="Requests failed:",
             absolute=self.main_stats["failed"],
             percentage=self.main_stats["failed_perc"],
-        ))
-        print(perc_fmt.format(
+        )
+        print_with_verbosity(failed_str, VERBLEVEL_NORMAL)
+
+        lost_str = perc_fmt.format(
             header="Lost:",
             absolute=self.main_stats["lost"],
             percentage=self.main_stats["lost_perc"],
-        ))
-        print(perc_fmt.format(
+        )
+        print_with_verbosity(lost_str, VERBLEVEL_NORMAL)
+
+        reordered_str = perc_fmt.format(
             header="Reordered:",
             absolute=self.main_stats["reordered"],
             percentage=self.main_stats["reordered_perc"],
-        ))
-        print(perc_fmt.format(
+        )
+        print_with_verbosity(reordered_str, VERBLEVEL_NORMAL)
+
+        malformed_str = perc_fmt.format(
             header="Malformed:",
             absolute=self.main_stats["malformed"],
             percentage=self.main_stats["malformed_perc"],
-        ))
+        )
+        print_with_verbosity(malformed_str, VERBLEVEL_NORMAL)
 
         if self.resp_codes:
-            print("\nResponse codes statistics:")
+            print_with_verbosity("\nResponse codes statistics:", VERBLEVEL_NORMAL)
             for code in self.resp_codes:
-                print(perc_fmt.format(
+                code_str = perc_fmt.format(
                     header=str(code),
                     absolute=self.resp_codes[code],
                     percentage=self.resp_codes_percs[code],
-                ))
+                )
+                print_with_verbosity(code_str, VERBLEVEL_NORMAL)
 
         if self.socket_errors:
-            print("\nNetwork errors statistics:")
+            print_with_verbosity("\nNetwork errors statistics:", VERBLEVEL_NORMAL)
             for e in self.socket_errors:
-                print(perc_fmt.format(
+                sock_err_str= perc_fmt.format(
                     header=str(e),
                     absolute=self.socket_errors[e],
                     percentage=self.socket_errors_percs[e],
-                ))
+                )
+                print_with_verbosity(sock_err_str, VERBLEVEL_NORMAL)
 
     def finalize(self):
         if not self.main_stats["sent"]:
@@ -577,6 +655,21 @@ class Statistics(metaclass=Singleton):
             self.main_stats["overall_result"] = True if self.main_stats["failed"] < self.main_stats["passed"] \
                                                  else False
 
+    def print_json(self):
+        """
+        Returns stats in JSON format.
+        NOTICE: use after finalizing
+        :return: json representation of the statistics
+        """
+        json_dict = {
+            "main_stats": self.main_stats,
+            "resp_codes": self.resp_codes,
+            "socket_errors": self.socket_errors,
+        }
+        print_with_verbosity(json.dumps(json_dict), VERBLEVEL_RESULTS)
+
+    def overall_result(self):
+        return self.main_stats["overall_result"]
 
 class SIPOptionsBaseHandler(asyncio.Protocol):
     def __init__(self, on_con_lost):
@@ -605,38 +698,52 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
         else:
             logging.fatal("Address family {sock.family} is not supported}")
 
-
         if self.c.dont_set_df_bit:
-            if platform.system() == "Linux":
-            # small platform-specific notices
-            # df bit often set on linux systems because pmtu discovery often enabled by default
-            # but better not to rely on it and explicitly set and unset this
-                if self._address_family == socket.AF_INET:
+            if self._address_family == socket.AF_INET:
+                if platform.system() == "Linux":
                     sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
+                elif platform.system() == "Darwin":
+                    IP_DF = 0x4000   # value from os x sdk
+                    sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_DF,)
+                elif platform.system() == "Windows":
+                    if not hasattr(socket, "IP_DONTFRAGMENT"):
+                        socket.IP_DONTFRAGMENT = 14    # value from Windows sdk
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_DONTFRAGMENT, 1)
                 else:
+                    print_with_verbosity(MSG_DF_BIT_NOT_SUPPORTED, VERBLEVEL_NORMAL)
+            elif self._address_family == socket.AF_INET6:
+                if platform.system() == "Linux":
                     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_DONTFRAG, 1)
+                else:
+                    print_with_verbosity(MSG_DF_BIT_NOT_SUPPORTED, VERBLEVEL_NORMAL)
             else:
-                print("Warning - Setting DF bit is only supported on Linux. Ignoring.")
+                # hope this code is unreachable
+                print_with_verbosity(
+                    f"FATAL: Address family {self._address_family} is not supported",
+                    VERBLEVEL_FATAL
+                )
+
+
 
     def _data_receiver_func(self, data, addr):
         data_length = len(data)
         suffix = "s" if len(data) > 1 else ""
         single_result = self.parse_received_data(data)
-        if self.c.verbose_mode:
-            print(f"\n--- Raw response:")
-            print(data.decode())
+        print_with_verbosity(f"\n--- Raw response:", VERBLEVEL_DEBUG)
+        print_with_verbosity(data.decode(), VERBLEVEL_DEBUG)
         self.stats.mark_received(single_result)
         host, port, *_ = addr
         if single_result.receive_status != "malformed":
-            print(self._response_message.format(
+            response_message_string = self._response_message.format(
                 data_length=data_length,
                 suffix=suffix,
                 endpoint=f"{host}:{port}" if self._address_family == socket.AF_INET else f"[{host}]:{port}",
                 status_line=single_result.status_line,
-                rtt=single_result.rtt)
+                rtt=single_result.rtt
             )
+            print_with_verbosity(response_message_string, VERBLEVEL_NORMAL)
         else:
-            print("Warning - malformed response received")
+            print_with_verbosity("Warning - malformed response received", VERBLEVEL_NORMAL)
 
     def datagram_received(self, data, addr):
         """
@@ -682,7 +789,7 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
         return result
 
     def error_received(self, exc):
-        print('Error received:', exc)
+        print_with_verbosity(f"Error received: {exc}", VERBLEVEL_NORMAL)
         stats = Statistics()
 
     def connection_lost(self, exc):
@@ -724,9 +831,8 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
         send_time = time.time()
         req_string, cseq, message = self.create_request()
         self._send(message)
-        if self.c.verbose_mode:
-            print("\n--- Raw request")
-            print(message)
+        print_with_verbosity("\n--- Raw request", VERBLEVEL_DEBUG)
+        print_with_verbosity(message, VERBLEVEL_DEBUG)
         snd_msg = self._send_message.format(
             msglen=len(message),
             suffix="s" if len(message) > 1 else "",
@@ -734,10 +840,10 @@ class SIPOptionsBaseHandler(asyncio.Protocol):
             current_req_count=self.current_req_count,
             req_string=req_string
         )
-
-        print(snd_msg)
+        print_with_verbosity(snd_msg, VERBLEVEL_NORMAL)
         self.stats.add_to_queue(cseq, send_time)
         self.current_req_count += 1
+
 
 class SIPOptionsUDPHandler(SIPOptionsBaseHandler):
     def _send(self, message):
@@ -762,7 +868,7 @@ async def send_loop(protocol):
                 protocol.send()
                 await asyncio.sleep(c.pause_between_transmits)
     except asyncio.CancelledError:
-        print("TEST Cancelled")
+        print_with_verbosity("Cancelled", VERBLEVEL_NORMAL)
     finally:
         pass
 
@@ -777,11 +883,12 @@ async def stop_send_loop(loop, task):
 
 
 def show_statistics():
-    print("\n=========== FINISHED ===========")
+    print_with_verbosity("\n=========== FINISHED ===========", VERBLEVEL_NORMAL)
     stats = Statistics()
     stats.finalize()
-    stats.pretty_print()
-
+    stats.final_print()
+    exitcode = 0 if stats.overall_result() else 1
+    exit(exitcode)
 
 async def main():
     # Get a reference to the event loop as we plan to use
@@ -799,9 +906,12 @@ async def main():
     if c.bind_addr:
         src_repr = c.bind_addr if ":" not in c.bind_addr else f"[{c.bind_addr}]"
         src_repr = src_repr if not c.bind_port else f"{src_repr}:{c.bind_port}"
-        print(f"Starting to send SIP OPTIONS from {src_repr} to {dst_repr} with size {c.payload_size}\n")
+        proto = c.proto
+        start_to_send_msg = f"Starting to send SIP OPTIONS from {src_repr} to {dst_repr}/{c.proto}"\
+                             "with size {c.payload_size}\n"
     else:
-        print(f"Starting to send SIP OPTIONS to {dst_repr} with size {c.payload_size}\n")
+        start_to_send_msg = f"Starting to send SIP OPTIONS to {dst_repr}/{c.proto} with size {c.payload_size}\n"
+    print_with_verbosity(start_to_send_msg, VERBLEVEL_NORMAL)
 
     reuse_port = True if platform.system() in ["Linux", "Darwin"] else False
 
@@ -839,8 +949,8 @@ async def main():
             if c.tls_maximum_version:
                 ssl_context.minimum_version = AVAILABLE_TLS_VERSIONS[c.tls_minimum_version]
         except ValueError as e:
-            print(f"Fatal error:\n{str(e)}")
-            exit(FAIL_EXIT_CODE)
+            print_with_verbosity(f"Fatal error:\n{str(e)}", VERBLEVEL_FATAL)
+            exit(SOCKET_ERROR_EXIT_CODE)
 
         try:
             transport, protocol = await loop.create_connection(
@@ -851,8 +961,8 @@ async def main():
                 ssl=ssl_context,
             )
         except (ssl.SSLError, socket.error, OSError) as e:
-            print(f"Fatal error :\n{str(e)}")
-            exit(FAIL_EXIT_CODE)
+            print_with_verbosity(f"Fatal error:\n{str(e)}", VERBLEVEL_FATAL)
+            exit(SOCKET_ERROR_EXIT_CODE)
 
     task = loop.create_task(send_loop(protocol))
     try:
@@ -865,12 +975,12 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nInterrupted")
+        print_with_verbosity("\nInterrupted", VERBLEVEL_NORMAL)
     except asyncio.exceptions.CancelledError:
         pass
     except (ssl.SSLError, socket.error, OSError) as e:
-        print(f"Fatal error:\n{str(e)}")
-        exit(FAIL_EXIT_CODE)
+        print_with_verbosity(f"Fatal error:\n{str(e)}", VERBLEVEL_FATAL)
+        exit(SOCKET_ERROR_EXIT_CODE)
 
 
 
